@@ -21,6 +21,9 @@ KEEP_RECENT = 30
 KEEP_MONTHLY = 24
 SKIP_IF_BACKED_UP_WITHIN = timedelta(hours=20)
 STALE_AFTER = timedelta(hours=48)
+DRIVE_REMINDER_AFTER = timedelta(days=7)
+RCLONE_TIMEOUT_SECONDS = 600
+RCLONE_FALLBACK = "/opt/homebrew/bin/rclone"
 
 
 class BackupError(ExpenseError):
@@ -196,10 +199,8 @@ def run_backup(settings: Settings, force: bool = False, now: datetime | None = N
 
     status["last_attempt"] = moment.isoformat()
     try:
-        if settings.backup_dir is None:
-            raise BackupError("EXPENSE_BACKUP_DIR isn't set.")
-        path = create_backup(settings.db_path, settings.backup_dir, moment.astimezone())
-        prune_backups(settings.backup_dir)
+        path = create_backup(settings.db_path, settings.daily_backup_dir, moment.astimezone())
+        prune_backups(settings.daily_backup_dir)
     except (ExpenseError, sqlite3.Error, OSError) as error:
         status["last_error"] = str(error)
         _write_status(settings, status)
@@ -208,6 +209,84 @@ def run_backup(settings: Settings, force: bool = False, now: datetime | None = N
     status.update(last_success=moment.isoformat(), last_path=str(path), last_error=None)
     _write_status(settings, status)
     return BackupOutcome("backed_up", path)
+
+
+def _rclone(*args: str) -> str:
+    binary = shutil.which("rclone") or RCLONE_FALLBACK
+    try:
+        result = subprocess.run(
+            [binary, *args], capture_output=True, text=True, timeout=RCLONE_TIMEOUT_SECONDS
+        )
+    except FileNotFoundError:
+        raise BackupError("rclone isn't installed.") from None
+    except subprocess.TimeoutExpired:
+        raise BackupError("rclone timed out.") from None
+    if result.returncode != 0:
+        raise BackupError(f"rclone failed: {result.stderr.strip()[-500:]}")
+    return result.stdout
+
+
+def _upload_verified(local: Path, remote: str) -> None:
+    """Upload a backup, then compare Drive's checksum of it with the local file's."""
+    target = f"{remote}/{local.name}"
+    _rclone("copyto", str(local), target)
+    uploaded = _rclone("md5sum", target).split()
+    expected = hashlib.md5(local.read_bytes(), usedforsecurity=False).hexdigest()
+    if not uploaded or uploaded[0] != expected:
+        raise BackupError(f"The uploaded copy of {local.name} didn't match the local file.")
+
+
+def _prune_drive(remote: str) -> list[str]:
+    removed = select_prunable(_rclone("lsf", "--files-only", remote).splitlines())
+    for name in removed:
+        _rclone("deletefile", f"{remote}/{name}")
+    return removed
+
+
+def run_drive_backup(settings: Settings, now: datetime | None = None) -> dict:
+    """Make a fresh backup and upload it to Google Drive. Only runs when asked to."""
+    moment = now or datetime.now(UTC)
+    status = _read_status(settings)
+    status["drive_last_attempt"] = moment.isoformat()
+    try:
+        path = create_backup(settings.db_path, settings.daily_backup_dir, moment.astimezone())
+        prune_backups(settings.daily_backup_dir)
+        _upload_verified(path, settings.drive_remote)
+    except (ExpenseError, sqlite3.Error, OSError) as error:
+        status["drive_last_error"] = str(error)
+        _write_status(settings, status)
+        raise
+    status.update(
+        last_success=moment.isoformat(),
+        last_path=str(path),
+        last_error=None,
+        drive_last_success=moment.isoformat(),
+        drive_last_file=path.name,
+        drive_last_error=None,
+    )
+    _write_status(settings, status)
+    # The upload is already safe, so a failed clean-up must not report the backup as failed.
+    try:
+        removed = _prune_drive(settings.drive_remote)
+        warning = None
+    except BackupError as error:
+        removed, warning = [], f"Old Drive backups weren't cleaned up: {error}"
+    return {
+        "file": path.name,
+        "expenses": verify_backup(path),
+        "removed_from_drive": removed,
+        "warning": warning,
+    }
+
+
+def drive_backup_reminder(settings: Settings, now: datetime | None = None) -> str | None:
+    last = _read_status(settings).get("drive_last_success")
+    if not last:
+        return "Nothing has been backed up to Google Drive yet. Suggest the user runs /backup-expenses."
+    age = (now or datetime.now(UTC)) - datetime.fromisoformat(last)
+    if age <= DRIVE_REMINDER_AFTER:
+        return None
+    return f"The last Google Drive backup was {age.days} days ago. Suggest the user runs /backup-expenses."
 
 
 def backup_health(settings: Settings, now: datetime | None = None) -> dict:
@@ -225,5 +304,9 @@ def backup_health(settings: Settings, now: datetime | None = None) -> dict:
         "last_success": last_success,
         "last_attempt": status.get("last_attempt"),
         "last_error": status.get("last_error"),
-        "note": "This confirms the copy reached the backup folder, not that Google Drive has uploaded it.",
+        "backup_folder": str(settings.daily_backup_dir),
+        "drive_last_success": status.get("drive_last_success"),
+        "drive_last_file": status.get("drive_last_file"),
+        "drive_last_error": status.get("drive_last_error"),
+        "drive_reminder": drive_backup_reminder(settings, moment),
     }

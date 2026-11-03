@@ -20,16 +20,16 @@ def plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 
 
-def build_plist(settings: Settings, backup_dir: Path, python: str) -> dict:
+def build_plist(settings: Settings, python: str) -> dict:
     """Runs at 9pm and at login, so that a day the Mac was off still gets a backup."""
     log = str(settings.data_dir / "backup.log")
+    environment = {"EXPENSE_DB_PATH": str(settings.db_path)}
+    if settings.backup_dir:
+        environment["EXPENSE_BACKUP_DIR"] = str(settings.backup_dir)
     return {
         "Label": LABEL,
         "ProgramArguments": [python, "-m", "expense_tracker.admin", "backup"],
-        "EnvironmentVariables": {
-            "EXPENSE_DB_PATH": str(settings.db_path),
-            "EXPENSE_BACKUP_DIR": str(backup_dir),
-        },
+        "EnvironmentVariables": environment,
         "StartCalendarInterval": {"Hour": BACKUP_HOUR, "Minute": 0},
         "RunAtLoad": True,
         "StandardOutPath": log,
@@ -41,16 +41,14 @@ def _launchctl(*args: str, check: bool = True) -> None:
     subprocess.run(["launchctl", *args], check=check, capture_output=True)
 
 
-def install_schedule(settings: Settings, backup_dir: Path) -> None:
-    if not backup_dir.parent.is_dir():
-        raise ExpenseError(f"{backup_dir.parent} doesn't exist. Is the cloud drive running?")
+def install_schedule(settings: Settings) -> None:
     settings.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = plist_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     domain = f"gui/{os.getuid()}"
     _launchctl("bootout", f"{domain}/{LABEL}", check=False)
     with open(path, "wb") as file:
-        plistlib.dump(build_plist(settings, backup_dir, sys.executable), file)
+        plistlib.dump(build_plist(settings, sys.executable), file)
     _launchctl("bootstrap", domain, str(path))
 
 
@@ -65,13 +63,13 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("init", help="create the database if it doesn't exist")
     run = commands.add_parser("backup", help="back up now, unless one ran recently")
     run.add_argument("--force", action="store_true", help="back up even if one ran recently")
+    commands.add_parser("drive-backup", help="back up now and upload to Google Drive")
     commands.add_parser("status", help="show whether backups are working")
     restore = commands.add_parser("restore", help="restore a database from a backup file")
     restore.add_argument("file", type=Path)
     restore.add_argument("--to", type=Path, help="where to restore; defaults to the live database")
     restore.add_argument("--force", action="store_true", help="replace an existing database")
-    schedule = commands.add_parser("install-schedule", help="run the backup daily")
-    schedule.add_argument("--backup-dir", type=Path, required=True)
+    commands.add_parser("install-schedule", help="run the local backup daily")
     commands.add_parser("uninstall-schedule", help="stop the daily backup")
     args = parser.parse_args(argv)
 
@@ -84,6 +82,12 @@ def main(argv: list[str] | None = None) -> int:
             outcome = backup.run_backup(settings, force=args.force)
             print({"backed_up": f"Backed up to {outcome.path}", "skipped": "Backed up recently; skipped.",
                    "no_database": "No database yet; nothing to back up."}[outcome.status])
+        elif args.command == "drive-backup":
+            result = backup.run_drive_backup(settings)
+            print(f"Uploaded and verified {result['file']} ({result['expenses']} expenses).")
+            print(f"Old backups removed from Drive: {len(result['removed_from_drive'])}.")
+            if result["warning"]:
+                print(f"Warning: {result['warning']}")
         elif args.command == "status":
             for key, value in backup.backup_health(settings).items():
                 print(f"{key}: {value}")
@@ -95,8 +99,8 @@ def main(argv: list[str] | None = None) -> int:
             if safety:
                 print(f"The replaced database was saved to {safety}.")
         elif args.command == "install-schedule":
-            install_schedule(settings, args.backup_dir.expanduser())
-            print(f"Daily backup installed, to {args.backup_dir}.")
+            install_schedule(settings)
+            print(f"Daily backup installed, to {settings.daily_backup_dir}.")
         elif args.command == "uninstall-schedule":
             uninstall_schedule()
             print("Daily backup removed.")

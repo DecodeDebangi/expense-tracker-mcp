@@ -69,6 +69,7 @@ A personal MCP server for logging and evaluating expenses through Claude, built 
 - `add_expense` warns about a likely duplicate (same amount, merchant and date) rather than silently saving it.
 - Input checks with clear errors: amounts, dates, currency codes, unknown categories.
 - Daily `launchd` backup using SQLite's own backup method, keeping the newest 30 plus one per month for 24 months, plus a tested restore command. Failures show a Mac notification and appear in `backup_status`.
+- Manual `/backup-expenses` skill for Google Drive, with a reminder from `add_expense` when the last upload is over 7 days old.
 - `export_csv`, writing outside the repo.
 
 **Done when:** tests cover totals, rounding, soft delete and migrations, and a backup has actually been restored into a new database.
@@ -136,7 +137,7 @@ Phones can't reach a server running on a Mac, so this phase hosts it.
 ## Decisions
 
 - [x] Default currency: INR
-- [x] Backup location: a Google Drive folder synced by Google Drive for desktop, set with `EXPENSE_BACKUP_DIR` so the account path stays out of the repo. Only backup copies go here, never the live database.
+- [x] Backups: automatic daily copies to a local folder, plus a manual `/backup-expenses` skill that uploads to Google Drive with rclone (`drive.file` access only) and verifies the checksum. Synced-folder backups failed from a background job (`EDEADLK`), and the Drive connector would put the data through the conversation.
 - [x] GitHub repo: public
 - [x] Database: SQLite until Phase 5
 - [ ] Phase 5 hosting (decide when Phase 5 starts; Neon is also an option, though it would need some query changes)

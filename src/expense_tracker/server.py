@@ -8,7 +8,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from expense_tracker.backup import backup_health
+from expense_tracker.backup import backup_health, drive_backup_reminder
 from expense_tracker.config import load_settings
 from expense_tracker.errors import ExpenseError
 from expense_tracker.storage import Storage
@@ -63,9 +63,13 @@ def create_server(storage: Storage) -> MCPServer:
             allow_duplicate: Save even if a matching expense exists. Only set after the user confirms.
             client_request_id: Optional unique ID that makes retrying this request safe.
         """
-        return storage.add_expense(
+        result = storage.add_expense(
             amount, merchant, category, occurred_on, currency, note, allow_duplicate, client_request_id
         )
+        reminder = drive_backup_reminder(storage.settings)
+        if result["saved"] and reminder:
+            result["backup_reminder"] = reminder
+        return result
 
     @server.tool(annotations=READ_ONLY)
     @_readable_errors

@@ -12,6 +12,7 @@ class Settings:
     db_path: Path
     backup_dir: Path | None = None
     default_currency: str = "INR"
+    drive_remote: str = "expense-drive:expense-tracker-backups"
 
     @property
     def data_dir(self) -> Path:
@@ -20,6 +21,10 @@ class Settings:
     @property
     def local_backup_dir(self) -> Path:
         return self.data_dir / "backups"
+
+    @property
+    def daily_backup_dir(self) -> Path:
+        return self.backup_dir or self.local_backup_dir
 
     @property
     def export_dir(self) -> Path:
@@ -36,4 +41,5 @@ def load_settings() -> Settings:
         db_path=Path(os.environ.get("EXPENSE_DB_PATH", DEFAULT_DB_PATH)).expanduser(),
         backup_dir=Path(backup_dir).expanduser() if backup_dir else None,
         default_currency=os.environ.get("EXPENSE_DEFAULT_CURRENCY", "INR"),
+        drive_remote=os.environ.get("EXPENSE_DRIVE_REMOTE", Settings.drive_remote),
     )

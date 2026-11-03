@@ -109,3 +109,8 @@ def test_real_server_process_over_stdio(tmp_path: Path) -> None:
     result = asyncio.run(run())
     assert result.structured_content["totals"][0]["total_minor"] == 9999
     assert Storage(Settings(db_path=db)).list_expenses()["total"] == 1
+
+
+def test_add_expense_passes_on_the_drive_backup_reminder(storage: Storage) -> None:
+    result = call(storage, ("add_expense", {"amount": 5, "merchant": "A", "category": "Food"}))[0]
+    assert "/backup-expenses" in result.structured_content["backup_reminder"]
