@@ -63,7 +63,6 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("init", help="create the database if it doesn't exist")
     run = commands.add_parser("backup", help="back up now, unless one ran recently")
     run.add_argument("--force", action="store_true", help="back up even if one ran recently")
-    commands.add_parser("drive-backup", help="back up now and upload to Google Drive")
     commands.add_parser("status", help="show whether backups are working")
     restore = commands.add_parser("restore", help="restore a database from a backup file")
     restore.add_argument("file", type=Path)
@@ -82,12 +81,6 @@ def main(argv: list[str] | None = None) -> int:
             outcome = backup.run_backup(settings, force=args.force)
             print({"backed_up": f"Backed up to {outcome.path}", "skipped": "Backed up recently; skipped.",
                    "no_database": "No database yet; nothing to back up."}[outcome.status])
-        elif args.command == "drive-backup":
-            result = backup.run_drive_backup(settings)
-            print(f"Uploaded and verified {result['file']} ({result['expenses']} expenses).")
-            print(f"Old backups removed from Drive: {len(result['removed_from_drive'])}.")
-            if result["warning"]:
-                print(f"Warning: {result['warning']}")
         elif args.command == "status":
             for key, value in backup.backup_health(settings).items():
                 print(f"{key}: {value}")

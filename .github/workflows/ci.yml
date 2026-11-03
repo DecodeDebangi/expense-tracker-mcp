@@ -13,7 +13,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: sudo apt-get update && sudo apt-get install -y rclone
       - run: uv sync --locked
       - name: Check no private data is tracked
         run: uv run python scripts/check_tracked_files.py
