@@ -16,7 +16,7 @@ from expense_tracker.errors import ExpenseError
 MAX_PAGE_SIZE = 500
 EXPENSE_COLUMNS = """
     e.id, e.amount_minor, e.currency, e.occurred_on, e.merchant, c.name AS category,
-    s.name AS subcategory, e.note,
+    s.name AS subcategory, e.funded_by_income_id, e.note,
     e.source, e.created_at, e.updated_at, e.deleted_at
 """
 EXPENSE_FROM = """FROM expenses e
@@ -25,12 +25,29 @@ EXPENSE_FROM = """FROM expenses e
 GROUP_EXPRESSIONS = {
     "category": "c.name",
     "subcategory": "c.name || ' / ' || coalesce(s.name, '(none)')",
-    "merchant": "e.merchant COLLATE NOCASE",
+    "merchant": "coalesce(e.merchant, '(no merchant)') COLLATE NOCASE",
     "month": "substr(e.occurred_on, 1, 7)",
+    "day": "e.occurred_on",
 }
+DATE_ORDERED_GROUPS = ("month", "day")
+INCOME_GROUP_EXPRESSIONS = {
+    "type": "t.name",
+    "source": "coalesce(i.source, '(no source)') COLLATE NOCASE",
+    "month": "substr(i.received_on, 1, 7)",
+}
+INCOME_SELECT = """SELECT i.id, i.amount_minor, i.currency, i.received_on, t.name AS income_type,
+    t.is_regular, i.source, i.period_start, i.period_end, i.note, i.created_at, i.updated_at,
+    i.deleted_at,
+    coalesce((SELECT sum(x.amount_minor) FROM expenses x
+        WHERE x.funded_by_income_id = i.id AND x.deleted_at IS NULL), 0) AS linked_spent_minor
+    FROM income i JOIN income_types t ON t.id = i.income_type_id"""
+INCOME_CSV_FIELDS = (
+    "id", "received_on", "amount", "amount_minor", "currency", "income_type", "source",
+    "period_start", "period_end", "note", "created_at", "updated_at", "deleted_at",
+)
 CSV_FIELDS = (
     "id", "occurred_on", "amount", "amount_minor", "currency", "merchant", "category",
-    "subcategory", "note", "source", "created_at", "updated_at", "deleted_at",
+    "subcategory", "funded_by_income_id", "note", "source", "created_at", "updated_at", "deleted_at",
 )
 
 
@@ -42,6 +59,18 @@ def _expense(row: sqlite3.Row) -> dict:
     expense = dict(row)
     expense["amount"] = validation.format_amount(row["amount_minor"], row["currency"])
     return expense
+
+
+def _income(row: sqlite3.Row) -> dict:
+    income = dict(row)
+    code = row["currency"]
+    income["is_regular"] = bool(row["is_regular"])
+    income["amount"] = validation.format_amount(row["amount_minor"], code)
+    income["linked_spent"] = validation.format_amount(row["linked_spent_minor"], code)
+    remaining = row["amount_minor"] - row["linked_spent_minor"]
+    income["remaining_minor"] = remaining
+    income["remaining"] = validation.format_amount(remaining, code)
+    return income
 
 
 def _money(minor: int, currency: str) -> dict:
@@ -103,6 +132,36 @@ class Storage:
         return row["id"]
 
     @staticmethod
+    def _check_funding(
+        conn: sqlite3.Connection,
+        income_id: str,
+        currency: str,
+        amount_minor: int,
+        expense_id: str | None = None,
+    ) -> None:
+        """An expense can only be linked to income it fits within, so "remaining" stays true."""
+        income = conn.execute(
+            "SELECT amount_minor, currency, deleted_at FROM income WHERE id = ?", (income_id,)
+        ).fetchone()
+        if income is None:
+            raise ExpenseError(f"No income with id '{income_id}'. Use list_income to find it.")
+        if income["deleted_at"]:
+            raise ExpenseError("That income entry is deleted.")
+        if income["currency"] != currency:
+            raise ExpenseError(
+                f"That income is in {income['currency']}, but the expense is in {currency}."
+            )
+        linked = conn.execute(
+            """SELECT coalesce(sum(amount_minor), 0) FROM expenses
+            WHERE funded_by_income_id = ? AND deleted_at IS NULL AND id IS NOT ?""",
+            (income_id, expense_id),
+        ).fetchone()[0]
+        remaining = income["amount_minor"] - linked
+        if amount_minor > remaining:
+            left = validation.format_amount(remaining, currency)
+            raise ExpenseError(f"That income only has {currency} {left} left to link.")
+
+    @staticmethod
     def _get_expense(conn: sqlite3.Connection, expense_id: str) -> sqlite3.Row:
         row = conn.execute(
             f"SELECT {EXPENSE_COLUMNS} {EXPENSE_FROM} WHERE e.id = ?", (expense_id,)
@@ -114,7 +173,7 @@ class Storage:
     def add_expense(
         self,
         amount: str | int | float,
-        merchant: str,
+        merchant: str | None,
         category: str,
         occurred_on: str | None = None,
         currency: str | None = None,
@@ -122,6 +181,7 @@ class Storage:
         allow_duplicate: bool = False,
         client_request_id: str | None = None,
         subcategory: str | None = None,
+        funded_by_income_id: str | None = None,
     ) -> dict:
         code = validation.parse_currency(currency or self.settings.default_currency)
         amount_minor = validation.parse_amount(amount, code)
@@ -142,12 +202,20 @@ class Storage:
             subcategory_id = (
                 self._active_subcategory_id(conn, category_id, subcategory) if subcategory else None
             )
+            if funded_by_income_id:
+                self._check_funding(conn, funded_by_income_id, code, amount_minor)
             if not allow_duplicate:
+                # With no merchant to compare, the category stands in for it.
+                match, value = (
+                    ("e.merchant = ? COLLATE NOCASE", merchant)
+                    if merchant
+                    else ("e.merchant IS NULL AND e.category_id = ?", category_id)
+                )
                 duplicates = conn.execute(
                     f"""SELECT {EXPENSE_COLUMNS} {EXPENSE_FROM}
                     WHERE e.deleted_at IS NULL AND e.amount_minor = ? AND e.currency = ?
-                      AND e.occurred_on = ? AND e.merchant = ? COLLATE NOCASE""",
-                    (amount_minor, code, day, merchant),
+                      AND e.occurred_on = ? AND {match}""",
+                    (amount_minor, code, day, value),
                 ).fetchall()
                 if duplicates:
                     return {
@@ -162,10 +230,11 @@ class Storage:
             now = _now()
             conn.execute(
                 """INSERT INTO expenses (id, amount_minor, currency, occurred_on, merchant,
-                    category_id, subcategory_id, note, client_request_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (expense_id, amount_minor, code, day, merchant, category_id, subcategory_id, note,
-                 client_request_id, now, now),
+                    category_id, subcategory_id, funded_by_income_id, note, client_request_id,
+                    created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (expense_id, amount_minor, code, day, merchant, category_id, subcategory_id,
+                 funded_by_income_id or None, note, client_request_id, now, now),
             )
             return {
                 "status": "saved",
@@ -182,6 +251,7 @@ class Storage:
         currency: str | None = None,
         include_deleted: bool = False,
         subcategory: str | None = None,
+        funded_by_income_id: str | None = None,
     ) -> tuple[str, list]:
         start, end = validation.parse_date_range(start_date, end_date)
         clauses, params = ["1 = 1"], []
@@ -196,6 +266,9 @@ class Storage:
         if category:
             clauses.append("c.name = ?")
             params.append(validation.clean_category_name(category))
+        if funded_by_income_id:
+            clauses.append("e.funded_by_income_id = ?")
+            params.append(funded_by_income_id)
         if subcategory:
             clauses.append("s.name = ?")
             params.append(validation.clean_category_name(subcategory))
@@ -219,13 +292,15 @@ class Storage:
         limit: int = 50,
         offset: int = 0,
         subcategory: str | None = None,
+        funded_by_income_id: str | None = None,
     ) -> dict:
         if not 1 <= limit <= MAX_PAGE_SIZE:
             raise ExpenseError(f"The limit must be between 1 and {MAX_PAGE_SIZE}.")
         if offset < 0:
             raise ExpenseError("The offset can't be negative.")
         where, params = self._filters(
-            start_date, end_date, category, merchant, currency, include_deleted, subcategory
+            start_date, end_date, category, merchant, currency, include_deleted, subcategory,
+            funded_by_income_id,
         )
         with self._connection() as conn:
             total = conn.execute(
@@ -248,8 +323,12 @@ class Storage:
         category: str | None = None,
         note: str | None = None,
         subcategory: str | None = None,
+        funded_by_income_id: str | None = None,
     ) -> dict:
-        """An empty subcategory clears it, and moving to another category also clears it unless a new one is given."""
+        """An empty merchant, subcategory or income link clears it.
+
+        Moving to another category also clears the subcategory unless a new one is given.
+        """
         changes: dict[str, object] = {}
         with self._connection() as conn, transaction(conn):
             current = self._get_expense(conn, expense_id)
@@ -283,8 +362,19 @@ class Storage:
                 changes["subcategory_id"] = None
             if note is not None:
                 changes["note"] = validation.clean_note(note)
+            if funded_by_income_id is not None:
+                changes["funded_by_income_id"] = funded_by_income_id.strip() or None
             if not changes:
                 raise ExpenseError("Nothing to change.")
+            funding = changes.get("funded_by_income_id", current["funded_by_income_id"])
+            if funding:
+                self._check_funding(
+                    conn,
+                    funding,
+                    code,
+                    changes.get("amount_minor", current["amount_minor"]),
+                    expense_id,
+                )
 
             assignments = ", ".join(f"{column} = ?" for column in changes)
             conn.execute(
@@ -306,8 +396,17 @@ class Storage:
 
     def restore_expense(self, expense_id: str) -> dict:
         with self._connection() as conn, transaction(conn):
-            if not self._get_expense(conn, expense_id)["deleted_at"]:
+            expense = self._get_expense(conn, expense_id)
+            if not expense["deleted_at"]:
                 raise ExpenseError("That expense isn't deleted.")
+            if expense["funded_by_income_id"]:
+                self._check_funding(
+                    conn,
+                    expense["funded_by_income_id"],
+                    expense["currency"],
+                    expense["amount_minor"],
+                    expense_id,
+                )
             conn.execute(
                 "UPDATE expenses SET deleted_at = NULL, updated_at = ? WHERE id = ?",
                 (_now(), expense_id),
@@ -527,7 +626,7 @@ class Storage:
             start_date, end_date, category, None, currency, subcategory=subcategory
         )
         group = GROUP_EXPRESSIONS[group_by]
-        order = "e.currency, grp" if group_by == "month" else "e.currency, total DESC, grp"
+        order = "e.currency, grp" if group_by in DATE_ORDERED_GROUPS else "e.currency, total DESC, grp"
         with self._connection() as conn:
             totals = conn.execute(
                 f"""SELECT e.currency, sum(e.amount_minor) AS total, count(*) AS n
@@ -564,12 +663,449 @@ class Storage:
                 params,
             ).fetchall()
 
+        return self._write_csv("expenses", CSV_FIELDS, [_expense(row) for row in rows])
+
+    def _write_csv(self, prefix: str, fields: tuple[str, ...], rows: list[dict]) -> dict:
         export_dir = self.settings.export_dir
         export_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path = export_dir / f"expenses-{datetime.now():%Y%m%d-%H%M%S-%f}.csv"
+        path = export_dir / f"{prefix}-{datetime.now():%Y%m%d-%H%M%S-%f}.csv"
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
-            writer.writerows(_expense(row) for row in rows)
+            writer.writerows(rows)
         return {"path": str(path), "rows": len(rows)}
+
+    @staticmethod
+    def _active_income_type_id(conn: sqlite3.Connection, name: str) -> int:
+        row = conn.execute(
+            "SELECT id, archived_at FROM income_types WHERE name = ?",
+            (validation.clean_category_name(name),),
+        ).fetchone()
+        if row is None or row["archived_at"]:
+            problem = "is archived" if row else "doesn't exist"
+            names = [
+                r["name"]
+                for r in conn.execute(
+                    "SELECT name FROM income_types WHERE archived_at IS NULL ORDER BY name"
+                )
+            ]
+            raise ExpenseError(f"The income type '{name}' {problem}. Available: {', '.join(names)}.")
+        return row["id"]
+
+    @staticmethod
+    def _get_income(conn: sqlite3.Connection, income_id: str) -> sqlite3.Row:
+        row = conn.execute(f"{INCOME_SELECT} WHERE i.id = ?", (income_id,)).fetchone()
+        if row is None:
+            raise ExpenseError(f"No income with id '{income_id}'.")
+        return row
+
+    def add_income(
+        self,
+        amount: str | int | float,
+        income_type: str,
+        received_on: str | None = None,
+        currency: str | None = None,
+        source: str | None = None,
+        period_start: str | None = None,
+        period_end: str | None = None,
+        note: str | None = None,
+        allow_duplicate: bool = False,
+        client_request_id: str | None = None,
+    ) -> dict:
+        code = validation.parse_currency(currency or self.settings.default_currency)
+        amount_minor = validation.parse_amount(amount, code)
+        day = validation.parse_expense_date(received_on, "received date")
+        first, last = validation.parse_period(period_start, period_end)
+        source = validation.clean_merchant(source)
+        note = validation.clean_note(note)
+
+        with self._connection() as conn, transaction(conn):
+            if client_request_id:
+                existing = conn.execute(
+                    f"{INCOME_SELECT} WHERE i.client_request_id = ?", (client_request_id,)
+                ).fetchone()
+                if existing:
+                    return {"status": "already_saved", "saved": False, "income": _income(existing)}
+
+            type_id = self._active_income_type_id(conn, income_type)
+            if not allow_duplicate:
+                duplicates = conn.execute(
+                    f"""{INCOME_SELECT} WHERE i.deleted_at IS NULL AND i.amount_minor = ?
+                    AND i.currency = ? AND i.received_on = ? AND i.income_type_id = ?""",
+                    (amount_minor, code, day, type_id),
+                ).fetchall()
+                if duplicates:
+                    return {
+                        "status": "possible_duplicate",
+                        "saved": False,
+                        "message": "Not saved. A matching entry exists; confirm with the user, "
+                        "then retry with allow_duplicate=true if this is separate income.",
+                        "matches": [_income(row) for row in duplicates],
+                    }
+
+            income_id = str(uuid.uuid4())
+            now = _now()
+            conn.execute(
+                """INSERT INTO income (id, amount_minor, currency, received_on, income_type_id,
+                    source, period_start, period_end, note, client_request_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (income_id, amount_minor, code, day, type_id, source, first, last, note,
+                 client_request_id, now, now),
+            )
+            return {"status": "saved", "saved": True, "income": _income(self._get_income(conn, income_id))}
+
+    def _income_filters(
+        self,
+        start_date: str | None,
+        end_date: str | None,
+        income_type: str | None = None,
+        source: str | None = None,
+        currency: str | None = None,
+        include_deleted: bool = False,
+    ) -> tuple[str, list]:
+        start, end = validation.parse_date_range(start_date, end_date)
+        clauses, params = ["1 = 1"], []
+        if not include_deleted:
+            clauses.append("i.deleted_at IS NULL")
+        if start:
+            clauses.append("i.received_on >= ?")
+            params.append(start)
+        if end:
+            clauses.append("i.received_on <= ?")
+            params.append(end)
+        if income_type:
+            clauses.append("t.name = ?")
+            params.append(validation.clean_category_name(income_type))
+        if source:
+            escaped = source.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("i.source LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+        if currency:
+            clauses.append("i.currency = ?")
+            params.append(validation.parse_currency(currency))
+        return " AND ".join(clauses), params
+
+    def list_income(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        income_type: str | None = None,
+        source: str | None = None,
+        currency: str | None = None,
+        include_deleted: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        if not 1 <= limit <= MAX_PAGE_SIZE:
+            raise ExpenseError(f"The limit must be between 1 and {MAX_PAGE_SIZE}.")
+        if offset < 0:
+            raise ExpenseError("The offset can't be negative.")
+        where, params = self._income_filters(
+            start_date, end_date, income_type, source, currency, include_deleted
+        )
+        with self._connection() as conn:
+            total = conn.execute(
+                f"""SELECT count(*) FROM income i JOIN income_types t ON t.id = i.income_type_id
+                WHERE {where}""",
+                params,
+            ).fetchone()[0]
+            rows = conn.execute(
+                f"""{INCOME_SELECT} WHERE {where}
+                ORDER BY i.received_on DESC, i.created_at DESC, i.id LIMIT ? OFFSET ?""",
+                [*params, limit, offset],
+            ).fetchall()
+        return {"total": total, "limit": limit, "offset": offset, "income": [_income(r) for r in rows]}
+
+    def update_income(
+        self,
+        income_id: str,
+        amount: str | int | float | None = None,
+        currency: str | None = None,
+        received_on: str | None = None,
+        income_type: str | None = None,
+        source: str | None = None,
+        period_start: str | None = None,
+        period_end: str | None = None,
+        note: str | None = None,
+    ) -> dict:
+        """An empty source or note clears it, and an empty period_start clears the period."""
+        changes: dict[str, object] = {}
+        with self._connection() as conn, transaction(conn):
+            current = self._get_income(conn, income_id)
+            if current["deleted_at"]:
+                raise ExpenseError("That income entry is deleted. Restore it before changing it.")
+            linked = current["linked_spent_minor"]
+
+            code = validation.parse_currency(currency) if currency else current["currency"]
+            if code != current["currency"]:
+                if amount is None:
+                    raise ExpenseError("Give the amount as well when changing the currency.")
+                if linked:
+                    raise ExpenseError("Expenses are linked to this income, so its currency can't change.")
+            if amount is not None:
+                changes["amount_minor"] = validation.parse_amount(amount, code)
+                if changes["amount_minor"] < linked:
+                    spent = validation.format_amount(linked, code)
+                    raise ExpenseError(f"Expenses of {code} {spent} are linked to this income, which is more than that.")
+            if currency:
+                changes["currency"] = code
+            if received_on is not None:
+                changes["received_on"] = validation.parse_expense_date(received_on, "received date")
+            if income_type is not None:
+                changes["income_type_id"] = self._active_income_type_id(conn, income_type)
+            if source is not None:
+                changes["source"] = validation.clean_merchant(source)
+            if note is not None:
+                changes["note"] = validation.clean_note(note)
+            if period_start == "":
+                changes["period_start"], changes["period_end"] = None, None
+            elif period_start is not None or period_end is not None:
+                first = period_start or current["period_start"]
+                last = period_end or (None if period_start else current["period_end"])
+                changes["period_start"], changes["period_end"] = validation.parse_period(first, last)
+            if not changes:
+                raise ExpenseError("Nothing to change.")
+
+            assignments = ", ".join(f"{column} = ?" for column in changes)
+            conn.execute(
+                f"UPDATE income SET {assignments}, updated_at = ? WHERE id = ?",
+                [*changes.values(), _now(), income_id],
+            )
+            return _income(self._get_income(conn, income_id))
+
+    def delete_income(self, income_id: str) -> dict:
+        with self._connection() as conn, transaction(conn):
+            current = self._get_income(conn, income_id)
+            if current["deleted_at"]:
+                raise ExpenseError("That income entry is already deleted.")
+            if current["linked_spent_minor"]:
+                raise ExpenseError("Expenses are linked to this income. Unlink or delete them first.")
+            now = _now()
+            conn.execute(
+                "UPDATE income SET deleted_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, income_id),
+            )
+            return _income(self._get_income(conn, income_id))
+
+    def restore_income(self, income_id: str) -> dict:
+        with self._connection() as conn, transaction(conn):
+            if not self._get_income(conn, income_id)["deleted_at"]:
+                raise ExpenseError("That income entry isn't deleted.")
+            conn.execute(
+                "UPDATE income SET deleted_at = NULL, updated_at = ? WHERE id = ?",
+                (_now(), income_id),
+            )
+            return _income(self._get_income(conn, income_id))
+
+    def list_income_types(self, include_archived: bool = False) -> list[dict]:
+        where = "" if include_archived else "WHERE t.archived_at IS NULL"
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""SELECT t.name, t.is_regular, t.archived_at IS NOT NULL AS archived,
+                    count(i.id) AS income_count
+                FROM income_types t
+                LEFT JOIN income i ON i.income_type_id = t.id AND i.deleted_at IS NULL
+                {where} GROUP BY t.id ORDER BY t.name"""
+            ).fetchall()
+        return [
+            {
+                "name": r["name"],
+                "is_regular": bool(r["is_regular"]),
+                "archived": bool(r["archived"]),
+                "income_count": r["income_count"],
+            }
+            for r in rows
+        ]
+
+    @staticmethod
+    def _income_type_row(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT id, name, archived_at FROM income_types WHERE name = ?",
+            (validation.clean_category_name(name),),
+        ).fetchone()
+        if row is None:
+            raise ExpenseError(f"The income type '{name}' doesn't exist.")
+        return row
+
+    def create_income_type(self, name: str, regular: bool = False) -> dict:
+        name = validation.clean_category_name(name)
+        with self._connection() as conn, transaction(conn):
+            existing = conn.execute(
+                "SELECT name, archived_at FROM income_types WHERE name = ?", (name,)
+            ).fetchone()
+            if existing:
+                state = "exists but is archived; unarchive it" if existing["archived_at"] else "already exists"
+                raise ExpenseError(f"The income type '{existing['name']}' {state}.")
+            conn.execute(
+                "INSERT INTO income_types (name, is_regular, created_at) VALUES (?, ?, ?)",
+                (name, int(regular), _now()),
+            )
+        return {"name": name, "is_regular": regular, "archived": False}
+
+    def rename_income_type(self, name: str, new_name: str) -> dict:
+        new_name = validation.clean_category_name(new_name)
+        with self._connection() as conn, transaction(conn):
+            row = self._income_type_row(conn, name)
+            clash = conn.execute(
+                "SELECT id FROM income_types WHERE name = ? AND id != ?", (new_name, row["id"])
+            ).fetchone()
+            if clash:
+                raise ExpenseError(f"The income type '{new_name}' already exists. Merge them instead.")
+            conn.execute("UPDATE income_types SET name = ? WHERE id = ?", (new_name, row["id"]))
+        return {"name": new_name}
+
+    def set_income_type_archived(self, name: str, archived: bool) -> dict:
+        with self._connection() as conn, transaction(conn):
+            row = self._income_type_row(conn, name)
+            if bool(row["archived_at"]) == archived:
+                state = "archived" if archived else "active"
+                raise ExpenseError(f"The income type '{row['name']}' is already {state}.")
+            conn.execute(
+                "UPDATE income_types SET archived_at = ? WHERE id = ?",
+                (_now() if archived else None, row["id"]),
+            )
+        return {"name": row["name"], "archived": archived}
+
+    def set_income_type_regular(self, name: str, regular: bool) -> dict:
+        with self._connection() as conn, transaction(conn):
+            row = self._income_type_row(conn, name)
+            conn.execute(
+                "UPDATE income_types SET is_regular = ? WHERE id = ?", (int(regular), row["id"])
+            )
+        return {"name": row["name"], "is_regular": regular}
+
+    def merge_income_type(self, name: str, into: str) -> dict:
+        """Move every entry, including deleted ones, and archive the old type."""
+        with self._connection() as conn, transaction(conn):
+            source = self._income_type_row(conn, name)
+            target_id = self._active_income_type_id(conn, into)
+            if source["id"] == target_id:
+                raise ExpenseError("An income type can't be merged into itself.")
+            now = _now()
+            moved = conn.execute(
+                "UPDATE income SET income_type_id = ?, updated_at = ? WHERE income_type_id = ?",
+                (target_id, now, source["id"]),
+            ).rowcount
+            conn.execute(
+                "UPDATE income_types SET archived_at = coalesce(archived_at, ?) WHERE id = ?",
+                (now, source["id"]),
+            )
+        return {"merged": source["name"], "into": into, "entries_moved": moved}
+
+    def summarize_income(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        group_by: str = "type",
+        income_type: str | None = None,
+        currency: str | None = None,
+    ) -> dict:
+        if group_by not in INCOME_GROUP_EXPRESSIONS:
+            raise ExpenseError(f"group_by must be one of: {', '.join(INCOME_GROUP_EXPRESSIONS)}.")
+        where, params = self._income_filters(start_date, end_date, income_type, None, currency)
+        group = INCOME_GROUP_EXPRESSIONS[group_by]
+        order = "i.currency, grp" if group_by == "month" else "i.currency, total DESC, grp"
+        source = "FROM income i JOIN income_types t ON t.id = i.income_type_id"
+        with self._connection() as conn:
+            totals = conn.execute(
+                f"""SELECT i.currency, sum(i.amount_minor) AS total, count(*) AS n,
+                    sum(CASE WHEN t.is_regular = 1 THEN i.amount_minor ELSE 0 END) AS regular
+                {source} WHERE {where} GROUP BY i.currency ORDER BY i.currency""",
+                params,
+            ).fetchall()
+            groups = conn.execute(
+                f"""SELECT {group} AS grp, i.currency, sum(i.amount_minor) AS total, count(*) AS n
+                {source} WHERE {where} GROUP BY {group}, i.currency ORDER BY {order}""",
+                params,
+            ).fetchall()
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "group_by": group_by,
+            "totals": [
+                {
+                    **_money(r["total"], r["currency"]),
+                    "count": r["n"],
+                    "regular": validation.format_amount(r["regular"], r["currency"]),
+                    "regular_minor": r["regular"],
+                    "one_off": validation.format_amount(r["total"] - r["regular"], r["currency"]),
+                    "one_off_minor": r["total"] - r["regular"],
+                }
+                for r in totals
+            ],
+            "groups": [
+                {"key": r["grp"], **_money(r["total"], r["currency"]), "count": r["n"]}
+                for r in groups
+            ],
+        }
+
+    def cash_flow(
+        self, start_date: str | None = None, end_date: str | None = None, currency: str | None = None
+    ) -> dict:
+        """Income against spending for each month, and overall, per currency."""
+        income_where, income_params = self._income_filters(start_date, end_date, currency=currency)
+        spend_where, spend_params = self._filters(start_date, end_date, currency=currency)
+        with self._connection() as conn:
+            income = conn.execute(
+                f"""SELECT substr(i.received_on, 1, 7) AS month, i.currency, sum(i.amount_minor) AS total,
+                    sum(CASE WHEN t.is_regular = 1 THEN i.amount_minor ELSE 0 END) AS regular
+                FROM income i JOIN income_types t ON t.id = i.income_type_id
+                WHERE {income_where} GROUP BY month, i.currency""",
+                income_params,
+            ).fetchall()
+            spending = conn.execute(
+                f"""SELECT substr(e.occurred_on, 1, 7) AS month, e.currency, sum(e.amount_minor) AS total
+                {EXPENSE_FROM} WHERE {spend_where} GROUP BY month, e.currency""",
+                spend_params,
+            ).fetchall()
+
+        rows: dict[tuple[str, str], dict[str, int]] = {}
+        for row in income:
+            rows[(row["month"], row["currency"])] = {"income": row["total"], "regular": row["regular"], "spent": 0}
+        for row in spending:
+            entry = rows.setdefault((row["month"], row["currency"]), {"income": 0, "regular": 0, "spent": 0})
+            entry["spent"] = row["total"]
+
+        def describe(values: dict[str, int], code: str) -> dict:
+            net = values["income"] - values["spent"]
+            return {
+                "currency": code,
+                "income": validation.format_amount(values["income"], code),
+                "income_minor": values["income"],
+                "regular_income": validation.format_amount(values["regular"], code),
+                "regular_income_minor": values["regular"],
+                "spent": validation.format_amount(values["spent"], code),
+                "spent_minor": values["spent"],
+                "net": validation.format_amount(net, code),
+                "net_minor": net,
+                "savings_rate_percent": round(net * 100 / values["income"], 1) if values["income"] else None,
+            }
+
+        totals: dict[str, dict[str, int]] = {}
+        for (_, code), values in rows.items():
+            total = totals.setdefault(code, {"income": 0, "regular": 0, "spent": 0})
+            for key, value in values.items():
+                total[key] += value
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "months": [
+                {"month": month, **describe(rows[(month, code)], code)}
+                for month, code in sorted(rows, key=lambda key: (key[1], key[0]))
+            ],
+            "totals": [describe(totals[code], code) for code in sorted(totals)],
+        }
+
+    def export_income_csv(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        include_deleted: bool = False,
+    ) -> dict:
+        where, params = self._income_filters(start_date, end_date, include_deleted=include_deleted)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"{INCOME_SELECT} WHERE {where} ORDER BY i.received_on, i.created_at, i.id", params
+            ).fetchall()
+        return self._write_csv("income", INCOME_CSV_FIELDS, [_income(row) for row in rows])

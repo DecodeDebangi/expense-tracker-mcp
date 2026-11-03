@@ -32,7 +32,7 @@ A personal MCP server for logging and evaluating expenses through Claude, built 
 | `amount_minor` | Integer in paise or cents; must be positive |
 | `currency` | ISO code such as `INR`; defaults to a configured currency |
 | `occurred_on` | Local date of the expense, separate from when it was logged |
-| `merchant` | Original text as entered |
+| `merchant` | Original text as entered; optional |
 | `category_id` | Required |
 | `note` | Optional |
 | `source` | `manual` or `import` |
@@ -48,6 +48,12 @@ A personal MCP server for logging and evaluating expenses through Claude, built 
 **`budgets`** (Phase 3): `category_id`, `amount_minor`, `currency`, `effective_from`. Keeping the start date means changing a budget doesn't rewrite how past months are judged.
 
 **`merchant_rules`** (Phase 3): maps a merchant pattern to a category, such as Swiggy to Food.
+
+**`income`:** `id`, `amount_minor`, `currency`, `received_on`, `income_type_id`, optional `source`, `period_start` and `period_end` (months the money covers, such as arrears), `note`, plus the same retry and soft-delete columns as expenses. Amounts are take-home, so they compare directly with spending.
+
+**`income_types`:** `name`, `is_regular`, `archived_at`. Starts with Salary (regular), Arrear, Bonus and Extra Income. `is_regular` is what lets analysis exclude one-offs.
+
+**Paying from income:** `expenses.funded_by_income_id` optionally links an expense to the income it came from. A link can't exceed what's left of that income or cross currencies, and income with linked expenses can't be deleted. "Remaining" only counts linked expenses, so it isn't a bank balance.
 
 **Multiple currencies:** totals are grouped by currency and never converted. Conversion would need historical exchange rates, so it stays out unless it turns out to be needed.
 
@@ -132,7 +138,7 @@ Phones can't reach a server running on a Mac, so this phase hosts it.
 - Bank account syncing
 - A web or mobile app
 - Multiple users
-- Income tracking or investments
+- Investments
 - Paid services of any kind
 
 ## Decisions

@@ -346,3 +346,243 @@ def test_export_includes_the_subcategory(storage: Storage) -> None:
     add_loan(storage, "Demo Bank", "Home Loan", "25000", "2026-05-01")
     with open(storage.export_csv()["path"], newline="") as file:
         assert next(csv.DictReader(file))["subcategory"] == "Home Loan"
+
+
+def test_merchant_is_optional_and_never_invented(storage: Storage) -> None:
+    expense = storage.add_expense("100", None, "Food", "2026-05-01")["expense"]
+    assert expense["merchant"] is None
+    assert storage.add_expense("100", "   ", "Food", "2026-05-02")["expense"]["merchant"] is None
+    assert storage.summarize(group_by="merchant")["groups"][0]["key"] == "(no merchant)"
+    named = storage.update_expense(expense["id"], merchant="Demo Cafe")
+    assert named["merchant"] == "Demo Cafe"
+    assert storage.update_expense(expense["id"], merchant="")["merchant"] is None
+
+
+def test_duplicate_check_without_a_merchant_compares_the_category(storage: Storage) -> None:
+    storage.add_expense("100", None, "Food", "2026-05-01")
+    assert storage.add_expense("100", None, "Food", "2026-05-01")["status"] == "possible_duplicate"
+    assert storage.add_expense("100", None, "Transport", "2026-05-01")["saved"] is True
+    assert storage.add_expense("100", "Demo Cafe", "Food", "2026-05-01")["saved"] is True
+    assert storage.add_expense("100", None, "Food", "2026-05-01", allow_duplicate=True)["saved"] is True
+
+
+def test_daily_breakdown_is_in_date_order_and_adds_up(seeded: Storage) -> None:
+    groups = seeded.summarize(group_by="day", currency="INR", start_date="2026-01-01", end_date="2026-01-31")["groups"]
+    assert [(g["key"], g["total_minor"]) for g in groups] == [
+        ("2026-01-03", 84500),
+        ("2026-01-05", 32000),
+        ("2026-01-10", 1250000),
+        ("2026-01-12", 64900),
+        ("2026-01-18", 18000),
+    ]
+    assert sum(g["total_minor"] for g in groups) == 1449400
+
+
+# The user's own example, with answers worked out by hand.
+@pytest.fixture
+def november(storage: Storage) -> dict:
+    salary = storage.add_income("1,00,000", "Salary", "2026-10-31", source="Demo Employer", note="After the hike")["income"]
+    arrear = storage.add_income(
+        "1,50,000", "Arrear", "2026-10-31", source="Demo Employer", period_start="2026-04", period_end="2026-10"
+    )["income"]
+    interiors = storage.add_expense(
+        "30,000", "Mother", "Home", "2026-10-31", subcategory="Interiors", funded_by_income_id=arrear["id"]
+    )["expense"]
+    return {"salary": salary, "arrear": arrear, "interiors": interiors}
+
+
+def test_worked_example_income_totals(storage: Storage, november: dict) -> None:
+    total = storage.summarize_income(start_date="2026-10-01", end_date="2026-10-31")["totals"][0]
+    assert total["total_minor"] == 25000000
+    assert total["total"] == "250000.00"
+    assert total["regular_minor"] == 10000000
+    assert total["one_off_minor"] == 15000000
+    assert total["count"] == 2
+
+
+def test_worked_example_linked_spending_and_remaining(storage: Storage, november: dict) -> None:
+    arrear = storage.list_income(income_type="Arrear")["income"][0]
+    assert (arrear["period_start"], arrear["period_end"]) == ("2026-04", "2026-10")
+    assert arrear["linked_spent_minor"] == 3000000
+    assert arrear["remaining"] == "120000.00"
+    assert storage.list_income(income_type="Salary")["income"][0]["remaining"] == "100000.00"
+    assert storage.list_expenses(funded_by_income_id=arrear["id"])["total"] == 1
+    assert storage.summarize()["totals"][0]["total_minor"] == 3000000
+
+
+def test_worked_example_cash_flow(storage: Storage, november: dict) -> None:
+    storage.add_expense("500", None, "Food", "2026-09-15")
+    flow = storage.cash_flow()
+    assert [(m["month"], m["income_minor"], m["spent_minor"], m["net_minor"]) for m in flow["months"]] == [
+        ("2026-09", 0, 50000, -50000),
+        ("2026-10", 25000000, 3000000, 22000000),
+    ]
+    assert flow["months"][0]["savings_rate_percent"] is None
+    assert flow["months"][0]["net"] == "-500.00"
+    assert flow["months"][1]["savings_rate_percent"] == 88.0
+    assert flow["months"][1]["regular_income_minor"] == 10000000
+    assert flow["totals"][0]["net_minor"] == 21950000
+
+
+def test_link_cannot_exceed_what_is_left_or_cross_currencies(storage: Storage, november: dict) -> None:
+    arrear_id = november["arrear"]["id"]
+    with pytest.raises(ExpenseError, match="120000.00 left"):
+        storage.add_expense("120000.01", "A", "Home", "2026-10-31", funded_by_income_id=arrear_id)
+    assert storage.add_expense("120000", "A", "Home", "2026-10-31", funded_by_income_id=arrear_id)["saved"] is True
+    assert storage.list_income(income_type="Arrear")["income"][0]["remaining_minor"] == 0
+    with pytest.raises(ExpenseError):
+        storage.add_expense("1", "B", "Food", "2026-10-31", funded_by_income_id=arrear_id)
+    with pytest.raises(ExpenseError, match="USD"):
+        storage.add_expense(
+            "1", "B", "Food", "2026-10-31", "USD", funded_by_income_id=november["salary"]["id"]
+        )
+    with pytest.raises(ExpenseError, match="No income"):
+        storage.add_expense("1", "B", "Food", "2026-10-31", funded_by_income_id="missing")
+
+
+def test_updating_a_linked_expense_rechecks_the_limit(storage: Storage, november: dict) -> None:
+    expense_id = november["interiors"]["id"]
+    with pytest.raises(ExpenseError, match="left"):
+        storage.update_expense(expense_id, amount="150000.01")
+    assert storage.update_expense(expense_id, amount="150000")["amount_minor"] == 15000000
+    with pytest.raises(ExpenseError, match="100000.00 left"):
+        storage.update_expense(expense_id, funded_by_income_id=november["salary"]["id"])
+    storage.update_expense(expense_id, amount="50000")
+    assert storage.update_expense(expense_id, funded_by_income_id=november["salary"]["id"])["funded_by_income_id"] == november["salary"]["id"]
+    assert storage.list_income(income_type="Arrear")["income"][0]["remaining_minor"] == 15000000
+    assert storage.update_expense(expense_id, funded_by_income_id="")["funded_by_income_id"] is None
+
+
+def test_deleting_and_restoring_a_linked_expense_moves_remaining(storage: Storage, november: dict) -> None:
+    arrear_id, expense_id = november["arrear"]["id"], november["interiors"]["id"]
+    storage.delete_expense(expense_id)
+    assert storage.list_income(income_type="Arrear")["income"][0]["remaining_minor"] == 15000000
+
+    other = storage.add_expense("150000", "A", "Home", "2026-10-31", funded_by_income_id=arrear_id)
+    with pytest.raises(ExpenseError, match="left"):
+        storage.restore_expense(expense_id)
+    storage.delete_expense(other["expense"]["id"])
+    assert storage.restore_expense(expense_id)["deleted_at"] is None
+
+
+def test_income_with_linked_expenses_is_protected(storage: Storage, november: dict) -> None:
+    arrear_id = november["arrear"]["id"]
+    with pytest.raises(ExpenseError, match="linked"):
+        storage.delete_income(arrear_id)
+    with pytest.raises(ExpenseError, match="linked"):
+        storage.update_income(arrear_id, amount="29999")
+    with pytest.raises(ExpenseError, match="linked"):
+        storage.update_income(arrear_id, currency="USD", amount="50000")
+    assert storage.update_income(arrear_id, amount="30000")["remaining_minor"] == 0
+
+    storage.delete_expense(november["interiors"]["id"])
+    assert storage.delete_income(arrear_id)["deleted_at"]
+    with pytest.raises(ExpenseError, match="deleted"):
+        storage.restore_expense(november["interiors"]["id"])
+    assert storage.summarize_income()["totals"][0]["total_minor"] == 10000000
+    assert storage.restore_income(arrear_id)["deleted_at"] is None
+    assert storage.restore_expense(november["interiors"]["id"])["deleted_at"] is None
+
+
+def test_income_duplicates_and_retries(storage: Storage) -> None:
+    first = storage.add_income("1000", "Bonus", "2026-05-01", client_request_id="r1")
+    assert storage.add_income("1000", "Bonus", "2026-05-01")["status"] == "possible_duplicate"
+    assert storage.add_income("1000", "Bonus", "2026-05-01", client_request_id="r1")["income"]["id"] == first["income"]["id"]
+    assert storage.add_income("1000", "Extra Income", "2026-05-01")["saved"] is True
+    assert storage.add_income("1000", "Bonus", "2026-05-01", allow_duplicate=True)["saved"] is True
+    assert storage.list_income()["total"] == 3
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"amount": "0", "income_type": "Salary"},
+        {"amount": "5", "income_type": "Salary", "received_on": "2999-01-01"},
+        {"amount": "5", "income_type": "Nope"},
+        {"amount": "5", "income_type": "Arrear", "period_start": "2026-13"},
+        {"amount": "5", "income_type": "Arrear", "period_start": "2026-10", "period_end": "2026-04"},
+        {"amount": "5", "income_type": "Arrear", "period_end": "2026-04"},
+    ],
+)
+def test_bad_income_is_rejected(storage: Storage, kwargs: dict) -> None:
+    with pytest.raises(ExpenseError):
+        storage.add_income(**kwargs)
+    assert storage.list_income()["total"] == 0
+
+
+def test_income_period_rules(storage: Storage) -> None:
+    single = storage.add_income("5", "Bonus", "2026-05-01", period_start="2026-03")["income"]
+    assert (single["period_start"], single["period_end"]) == ("2026-03", "2026-03")
+    wider = storage.update_income(single["id"], period_end="2026-04")
+    assert (wider["period_start"], wider["period_end"]) == ("2026-03", "2026-04")
+    moved = storage.update_income(single["id"], period_start="2026-01")
+    assert (moved["period_start"], moved["period_end"]) == ("2026-01", "2026-01")
+    cleared = storage.update_income(single["id"], period_start="")
+    assert (cleared["period_start"], cleared["period_end"]) == (None, None)
+
+
+def test_income_update_changes_only_what_is_given(storage: Storage) -> None:
+    income = storage.add_income("5", "Bonus", "2026-05-01", source="Demo", note="keep")["income"]
+    updated = storage.update_income(income["id"], amount="7.50", income_type="Extra Income")
+    assert (updated["amount_minor"], updated["income_type"]) == (750, "Extra Income")
+    assert (updated["source"], updated["note"]) == ("Demo", "keep")
+    assert storage.update_income(income["id"], source="")["source"] is None
+    with pytest.raises(ExpenseError):
+        storage.update_income(income["id"])
+    with pytest.raises(ExpenseError):
+        storage.update_income(income["id"], currency="USD")
+
+
+def test_income_type_lifecycle_and_regular_flag(storage: Storage) -> None:
+    assert {t["name"] for t in storage.list_income_types()} == {"Salary", "Arrear", "Bonus", "Extra Income"}
+    storage.create_income_type("Rental Income", regular=True)
+    with pytest.raises(ExpenseError):
+        storage.create_income_type("rental income")
+    storage.add_income("100", "Rental Income", "2026-05-01")
+    storage.add_income("50", "Bonus", "2026-05-01")
+    assert storage.summarize_income()["totals"][0]["regular_minor"] == 10000
+
+    storage.set_income_type_regular("Rental Income", False)
+    assert storage.summarize_income()["totals"][0]["regular_minor"] == 0
+
+    storage.rename_income_type("Rental Income", "Rent Received")
+    storage.set_income_type_archived("Rent Received", True)
+    with pytest.raises(ExpenseError, match="archived"):
+        storage.add_income("1", "Rent Received", "2026-05-02")
+    storage.set_income_type_archived("Rent Received", False)
+
+    assert storage.merge_income_type("Rent Received", "Extra Income")["entries_moved"] == 1
+    assert storage.summarize_income()["totals"][0]["total_minor"] == 15000
+    assert storage.list_income(income_type="Extra Income")["total"] == 1
+    with pytest.raises(ExpenseError):
+        storage.rename_income_type("Bonus", "Salary")
+    with pytest.raises(ExpenseError):
+        storage.merge_income_type("Bonus", "Bonus")
+
+
+def test_income_summary_groups(storage: Storage, november: dict) -> None:
+    storage.add_income("100", "Bonus", "2026-09-01")
+    by_type = storage.summarize_income()["groups"]
+    assert [(g["key"], g["total_minor"]) for g in by_type] == [("Arrear", 15000000), ("Salary", 10000000), ("Bonus", 10000)]
+    by_month = storage.summarize_income(group_by="month")["groups"]
+    assert [(g["key"], g["total_minor"]) for g in by_month] == [("2026-09", 10000), ("2026-10", 25000000)]
+    by_source = storage.summarize_income(group_by="source")["groups"]
+    assert [g["key"] for g in by_source] == ["Demo Employer", "(no source)"]
+
+
+def test_currencies_stay_apart_in_income_and_cash_flow(storage: Storage) -> None:
+    storage.add_income("100", "Salary", "2026-05-01")
+    storage.add_income("10", "Extra Income", "2026-05-01", "USD")
+    storage.add_expense("5", "A", "Food", "2026-05-01", "USD")
+    assert [t["currency"] for t in storage.summarize_income()["totals"]] == ["INR", "USD"]
+    assert [(t["currency"], t["net_minor"]) for t in storage.cash_flow()["totals"]] == [("INR", 10000), ("USD", 500)]
+
+
+def test_income_export_is_private_and_exact(storage: Storage, november: dict) -> None:
+    result = storage.export_income_csv()
+    path = Path(result["path"])
+    assert result["rows"] == 2
+    assert path.name.startswith("income-")
+    assert oct(path.stat().st_mode)[-3:] == "600"
+    with open(path, newline="") as file:
+        assert {r["amount"] for r in csv.DictReader(file)} == {"100000.00", "150000.00"}

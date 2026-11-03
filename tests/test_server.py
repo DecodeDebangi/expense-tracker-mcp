@@ -14,6 +14,8 @@ from expense_tracker.storage import Storage
 EXPECTED_TOOLS = {
     "add_expense", "list_expenses", "update_expense", "delete_expense", "restore_expense",
     "list_categories", "manage_categories", "summarize", "export_csv", "backup_status",
+    "add_income", "list_income", "update_income", "delete_income", "restore_income",
+    "list_income_types", "manage_income_types", "summarize_income", "cash_flow",
 }
 
 
@@ -123,5 +125,34 @@ def test_subcategories_through_the_client(storage: Storage) -> None:
     assert not created.is_error
     assert added.structured_content["expense"]["subcategory"] == "Tiffin"
     assert summary.structured_content["groups"][0]["key"] == "Food / Tiffin"
-    assert len(categories.structured_content["categories"]) == 14
+    assert len(categories.structured_content["categories"]) == 15
     assert "Available:" in error_text(bad)
+
+
+def test_quick_expense_with_no_merchant_through_the_client(storage: Storage) -> None:
+    result = call(storage, ("add_expense", {"amount": 100, "category": "Food"}))[0]
+    expense = result.structured_content["expense"]
+    assert (expense["amount_minor"], expense["merchant"]) == (10000, None)
+
+
+def test_salary_arrears_and_linked_expense_through_the_client(storage: Storage) -> None:
+    salary, arrear = call(
+        storage,
+        ("add_income", {"amount": 100000, "income_type": "Salary"}),
+        ("add_income", {"amount": 150000, "income_type": "Arrear", "period_start": "2026-04", "period_end": "2026-10"}),
+    )
+    arrear_id = arrear.structured_content["income"]["id"]
+    expense, listed, income_total, flow, bad_type = call(
+        storage,
+        ("add_expense", {"amount": 30000, "category": "Home", "subcategory": "Interiors", "merchant": "Mother", "funded_by_income_id": arrear_id}),
+        ("list_income", {"income_type": "Arrear"}),
+        ("summarize_income", {}),
+        ("cash_flow", {}),
+        ("add_income", {"amount": 5, "income_type": "Nope"}),
+    )
+    assert not salary.is_error
+    assert expense.structured_content["expense"]["funded_by_income_id"] == arrear_id
+    assert listed.structured_content["income"][0]["remaining"] == "120000.00"
+    assert income_total.structured_content["totals"][0]["total_minor"] == 25000000
+    assert flow.structured_content["totals"][0]["net"] == "220000.00"
+    assert "Available:" in error_text(bad_type)

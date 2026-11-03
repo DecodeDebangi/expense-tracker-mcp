@@ -81,13 +81,33 @@ def parse_date(value: str, field: str = "date") -> str:
     return text
 
 
-def parse_expense_date(value: str | None) -> str:
+def parse_expense_date(value: str | None, field: str = "expense date") -> str:
     if value is None:
         return date.today().isoformat()
-    parsed = parse_date(value, "expense date")
+    parsed = parse_date(value, field)
     if parsed > date.today().isoformat():
-        raise ExpenseError(f"The expense date {parsed} is in the future.")
+        raise ExpenseError(f"The {field} {parsed} is in the future.")
     return parsed
+
+
+def parse_month(value: str) -> str:
+    text = value.strip()
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", text):
+        raise ExpenseError(f"The month '{value}' must be in YYYY-MM format.")
+    return text
+
+
+def parse_period(start: str | None, end: str | None) -> tuple[str | None, str | None]:
+    """A period covers whole months; a single month can be given as just its start."""
+    if not start and not end:
+        return None, None
+    if not start:
+        raise ExpenseError("A period needs its first month.")
+    first = parse_month(start)
+    last = parse_month(end) if end else first
+    if first > last:
+        raise ExpenseError("The period's first month is after its last month.")
+    return first, last
 
 
 def parse_date_range(start: str | None, end: str | None) -> tuple[str | None, str | None]:
@@ -98,11 +118,8 @@ def parse_date_range(start: str | None, end: str | None) -> tuple[str | None, st
     return parsed_start, parsed_end
 
 
-def clean_merchant(value: str) -> str:
-    merchant = " ".join(value.split())
-    if not merchant:
-        raise ExpenseError("The merchant can't be empty.")
-    return merchant
+def clean_merchant(value: str | None) -> str | None:
+    return " ".join(value.split()) or None if value else None
 
 
 def clean_category_name(value: str) -> str:

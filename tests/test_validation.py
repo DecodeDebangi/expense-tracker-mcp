@@ -9,6 +9,8 @@ from expense_tracker.validation import (
     parse_currency,
     parse_date,
     parse_expense_date,
+    parse_month,
+    parse_period,
 )
 
 
@@ -73,3 +75,16 @@ def test_expense_date_defaults_to_today_and_rejects_the_future() -> None:
     assert parse_expense_date(None) == date.today().isoformat()
     with pytest.raises(ExpenseError):
         parse_expense_date((date.today() + timedelta(days=1)).isoformat())
+
+
+@pytest.mark.parametrize("value", ["2026-13", "2026-00", "2026-4", "26-04", "April"])
+def test_bad_months_are_rejected(value) -> None:
+    with pytest.raises(ExpenseError):
+        parse_month(value)
+
+
+def test_period_rules() -> None:
+    assert parse_period(None, None) == (None, None)
+    assert parse_period("2026-04", None) == ("2026-04", "2026-04")
+    assert parse_period("2026-04", "2026-10") == ("2026-04", "2026-10")
+    assert parse_period("2025-12", "2026-01") == ("2025-12", "2026-01")

@@ -86,8 +86,42 @@ def test_upgrading_from_the_first_schema_keeps_expenses_and_adds_subcategories(t
     assert (expense["amount_minor"], expense["category"], expense["subcategory"]) == (45050, "Food", None)
     assert len(list((tmp_path / "backups").iterdir())) == 1
     categories = {c["name"]: c for c in storage.list_categories()}
-    assert len(categories) == 14
+    assert len(categories) == 15
     assert all(c["subcategories"] for c in categories.values())
     loans = {s["name"] for s in categories["Loans & EMIs"]["subcategories"]}
     assert {"Home Loan", "Two-wheeler Loan"} <= loans
     assert "Monthly Support" in {s["name"] for s in categories["Family Support"]["subcategories"]}
+
+
+def test_upgrading_to_optional_merchants_keeps_every_field_and_the_safety_rules(tmp_path: Path) -> None:
+    db = tmp_path / "expenses.db"
+    migrate(db, tmp_path / "backups", [m for m in bundled_migrations() if m[0] <= 2])
+    conn = connect(db)
+    food = conn.execute("SELECT id FROM categories WHERE name = 'Food'").fetchone()[0]
+    dining = conn.execute(
+        "SELECT id FROM subcategories WHERE category_id = ? AND name = 'Dining Out'", (food,)
+    ).fetchone()[0]
+    conn.execute(
+        """INSERT INTO expenses (id, amount_minor, currency, occurred_on, merchant, category_id,
+            subcategory_id, note, client_request_id, created_at, updated_at, deleted_at)
+        VALUES ('a', 12345, 'INR', '2026-05-01', 'Demo Cafe', ?, ?, 'kept', 'req-1', 'c', 'u', 'd')""",
+        (food, dining),
+    )
+    conn.close()
+
+    storage = Storage(Settings(db_path=db, backup_dir=tmp_path / "backups"))
+
+    expense = storage.list_expenses(include_deleted=True)["expenses"][0]
+    assert (expense["amount_minor"], expense["merchant"], expense["subcategory"]) == (12345, "Demo Cafe", "Dining Out")
+    assert (expense["note"], expense["created_at"], expense["deleted_at"]) == ("kept", "c", "d")
+    assert storage.add_expense("1", "x", "Food", "2026-05-02", client_request_id="req-1")["status"] == "already_saved"
+
+    conn = connect(db)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE expenses SET category_id = (SELECT id FROM categories WHERE name = 'Rent')")
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(expenses)")}
+        assert {"expenses_occurred_on", "expenses_category_id", "expenses_subcategory_id"} <= indexes
+    finally:
+        conn.close()
