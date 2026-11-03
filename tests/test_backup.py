@@ -14,7 +14,7 @@ from expense_tracker.backup import (
     select_prunable,
     verify_backup,
 )
-from expense_tracker.config import Settings
+from expense_tracker.config import REPO_ROOT, Settings, load_settings
 from expense_tracker.storage import Storage
 
 NOW = datetime(2026, 11, 3, 21, 0, tzinfo=UTC)
@@ -153,6 +153,11 @@ def test_daily_backup_defaults_to_a_local_folder(seeded: Storage) -> None:
     path = run_backup(settings, now=NOW).path
     assert path.parent == settings.data_dir / "backups"
     assert verify_backup(path) == 14
+
+
+def test_backups_default_to_the_ignored_folder_in_the_repo(monkeypatch) -> None:
+    monkeypatch.delenv("EXPENSE_BACKUP_DIR", raising=False)
+    assert load_settings().local_backup_dir == REPO_ROOT / "backups"
 
 
 def test_missing_database_is_not_a_failure(settings: Settings) -> None:

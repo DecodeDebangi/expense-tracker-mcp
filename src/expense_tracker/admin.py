@@ -93,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"The replaced database was saved to {safety}.")
         elif args.command == "install-schedule":
             install_schedule(settings)
-            print(f"Daily backup installed, to {settings.daily_backup_dir}.")
+            print(f"Daily backup installed, to {settings.local_backup_dir}.")
         elif args.command == "uninstall-schedule":
             uninstall_schedule()
             print("Daily backup removed.")

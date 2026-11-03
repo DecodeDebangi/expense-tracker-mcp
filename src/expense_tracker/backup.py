@@ -196,8 +196,8 @@ def run_backup(settings: Settings, force: bool = False, now: datetime | None = N
 
     status["last_attempt"] = moment.isoformat()
     try:
-        path = create_backup(settings.db_path, settings.daily_backup_dir, moment.astimezone())
-        prune_backups(settings.daily_backup_dir)
+        path = create_backup(settings.db_path, settings.local_backup_dir, moment.astimezone())
+        prune_backups(settings.local_backup_dir)
     except (ExpenseError, sqlite3.Error, OSError) as error:
         status["last_error"] = str(error)
         _write_status(settings, status)
@@ -223,6 +223,6 @@ def backup_health(settings: Settings, now: datetime | None = None) -> dict:
         "last_success": last_success,
         "last_attempt": status.get("last_attempt"),
         "last_error": status.get("last_error"),
-        "backup_folder": str(settings.daily_backup_dir),
+        "backup_folder": str(settings.local_backup_dir),
         "note": "Backups are on this Mac only, so they won't survive losing it.",
     }

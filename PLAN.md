@@ -4,7 +4,7 @@ A personal MCP server for logging and evaluating expenses through Claude, built 
 
 ## Principles
 
-- **Code on GitHub, data never.** The real database lives outside the repo, so it can't be committed by accident.
+- **Code on GitHub, data never.** The real database lives outside the repo, and backups stay in an ignored folder that CI checks is never tracked.
 - **SQL does the maths, Claude does the explaining.** Every figure comes from a query, never from Claude's own arithmetic.
 - **Nothing is lost.** Deleting is reversible, backups run automatically, and schema changes go through migrations.
 - **Tools don't know where data lives.** Tools talk to a storage layer, so moving to hosted storage later doesn't change them.
@@ -136,7 +136,7 @@ Phones can't reach a server running on a Mac, so this phase hosts it.
 ## Decisions
 
 - [x] Default currency: INR
-- [x] Backups: automatic daily copies to a local folder on the Mac only. These don't survive losing the Mac; the user chose this over the setup that Google Drive needs (rclone now requires your own Google client ID).
+- [x] Backups: automatic daily copies to the repo's `backups/` folder, which git ignores, so they stay on the Mac only. These don't survive losing the Mac or deleting the repo folder; the user chose this over the setup that Google Drive needs (rclone now requires your own Google client ID).
 - [x] GitHub repo: public
 - [x] Database: SQLite until Phase 5
 - [ ] Phase 5 hosting (decide when Phase 5 starts; Neon is also an option, though it would need some query changes)
