@@ -1,0 +1,22 @@
+# Real financial data must never be committed.
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+exports/
+backups/
+statements/
+.env
+.env.*
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+
+# macOS
+.DS_Store

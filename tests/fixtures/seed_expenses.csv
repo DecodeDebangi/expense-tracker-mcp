@@ -1,0 +1,15 @@
+occurred_on,amount_minor,currency,merchant,category,note
+2026-01-03,84500,INR,Sample Grocer,Groceries,Weekly shop
+2026-01-05,32000,INR,Demo Cafe,Food,Lunch
+2026-01-10,1250000,INR,Example Homes,Rent,January rent
+2026-01-12,64900,INR,Test Stream,Subscriptions,Monthly plan
+2026-01-18,18000,INR,Metro Demo,Transport,Card top-up
+2026-02-02,91250,INR,Sample Grocer,Groceries,Weekly shop
+2026-02-07,47500,INR,Demo Cafe,Food,Dinner
+2026-02-10,1250000,INR,Example Homes,Rent,February rent
+2026-02-12,64900,INR,Test Stream,Subscriptions,Monthly plan
+2026-02-20,250000,INR,Sample Clinic,Health,Check-up
+2026-03-03,78075,INR,Sample Grocer,Groceries,Weekly shop
+2026-03-10,1250000,INR,Example Homes,Rent,March rent
+2026-03-12,64900,INR,Test Stream,Subscriptions,Monthly plan
+2026-03-15,1999,USD,Example Software,Subscriptions,Annual licence

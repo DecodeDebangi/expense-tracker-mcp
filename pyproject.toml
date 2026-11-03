@@ -1,0 +1,23 @@
+[project]
+name = "expense-tracker"
+version = "0.1.0"
+description = "A personal MCP server for logging and evaluating expenses through Claude"
+authors = [
+    { name = "Debangi", email = "debangiofficial@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "mcp==2.3.0",
+]
+
+[project.scripts]
+expense-tracker = "expense_tracker.server:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
