@@ -37,6 +37,7 @@ A personal MCP server for logging and evaluating expenses through Claude, built 
 | `note` | Optional |
 | `source` | `manual` or `import` |
 | `import_hash` | Unique when present; stops statement rows importing twice |
+| `client_request_id` | Unique when present; makes retried requests safe |
 | `created_at`, `updated_at` | UTC timestamps |
 | `deleted_at` | Soft delete; hidden from queries unless asked for |
 
@@ -64,10 +65,10 @@ A personal MCP server for logging and evaluating expenses through Claude, built 
 
 - Numbered SQL migrations, recorded in a `schema_version` table. The database is backed up automatically before any migration runs.
 - Storage layer holding all the SQL, with a small MCP tool layer on top.
-- Tools: `add_expense`, `list_expenses`, `update_expense`, `delete_expense`, `restore_expense`, `list_categories`, `manage_categories`, `summarize`.
+- Tools: `add_expense`, `list_expenses`, `update_expense`, `delete_expense`, `restore_expense`, `list_categories`, `manage_categories`, `summarize`, `backup_status`.
 - `add_expense` warns about a likely duplicate (same amount, merchant and date) rather than silently saving it.
 - Input checks with clear errors: amounts, dates, currency codes, unknown categories.
-- Daily `launchd` backup using SQLite's own backup method, keeping a limited history, plus a tested restore command.
+- Daily `launchd` backup using SQLite's own backup method, keeping the newest 30 plus one per month for 24 months, plus a tested restore command. Failures show a Mac notification and appear in `backup_status`.
 - `export_csv`, writing outside the repo.
 
 **Done when:** tests cover totals, rounding, soft delete and migrations, and a backup has actually been restored into a new database.
@@ -135,7 +136,7 @@ Phones can't reach a server running on a Mac, so this phase hosts it.
 ## Decisions
 
 - [x] Default currency: INR
-- [x] Backup location: iCloud Drive, in `~/Library/Mobile Documents/com~apple~CloudDocs/expense-tracker-backups/`. Only backup copies go here, never the live database.
+- [x] Backup location: a Google Drive folder synced by Google Drive for desktop, set with `EXPENSE_BACKUP_DIR` so the account path stays out of the repo. Only backup copies go here, never the live database.
 - [x] GitHub repo: public
 - [x] Database: SQLite until Phase 5
 - [ ] Phase 5 hosting (decide when Phase 5 starts; Neon is also an option, though it would need some query changes)
