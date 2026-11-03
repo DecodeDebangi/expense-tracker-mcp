@@ -109,3 +109,19 @@ def test_real_server_process_over_stdio(tmp_path: Path) -> None:
     result = asyncio.run(run())
     assert result.structured_content["totals"][0]["total_minor"] == 9999
     assert Storage(Settings(db_path=db)).list_expenses()["total"] == 1
+
+
+def test_subcategories_through_the_client(storage: Storage) -> None:
+    created, added, summary, categories, bad = call(
+        storage,
+        ("manage_categories", {"action": "create", "name": "Food", "subcategory": "Tiffin"}),
+        ("add_expense", {"amount": 80, "merchant": "A", "category": "Food", "subcategory": "Tiffin"}),
+        ("summarize", {"group_by": "subcategory"}),
+        ("list_categories", {}),
+        ("add_expense", {"amount": 80, "merchant": "B", "category": "Food", "subcategory": "Nope"}),
+    )
+    assert not created.is_error
+    assert added.structured_content["expense"]["subcategory"] == "Tiffin"
+    assert summary.structured_content["groups"][0]["key"] == "Food / Tiffin"
+    assert len(categories.structured_content["categories"]) == 14
+    assert "Available:" in error_text(bad)

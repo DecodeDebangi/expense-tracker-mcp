@@ -43,6 +43,8 @@ A personal MCP server for logging and evaluating expenses through Claude, built 
 
 **`categories`:** `id`, unique `name`, `archived_at`. Starts with a small default set. Renaming changes one row, and merging moves the expenses across.
 
+**`subcategories`:** `id`, `category_id`, `name` (unique within its category), `archived_at`. Optional on an expense through `expenses.subcategory_id`. Category totals include their subcategories, and database triggers reject a subcategory from a different category.
+
 **`budgets`** (Phase 3): `category_id`, `amount_minor`, `currency`, `effective_from`. Keeping the start date means changing a budget doesn't rewrite how past months are judged.
 
 **`merchant_rules`** (Phase 3): maps a merchant pattern to a category, such as Swiggy to Food.

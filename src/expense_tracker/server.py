@@ -17,7 +17,8 @@ INSTRUCTIONS = """Tracks the user's personal expenses.
 
 Always take figures from these tools and never calculate totals yourself. Amounts in different \
 currencies are never added together. Leave occurred_on out unless the user names a date, so that \
-the server uses today's date. If add_expense returns possible_duplicate, nothing was saved: ask \
+the server uses today's date. Choose a subcategory when one fits, and leave it out when none does; \
+see list_categories. If add_expense returns possible_duplicate, nothing was saved: ask \
 the user before retrying with allow_duplicate=true."""
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True)
@@ -50,6 +51,7 @@ def create_server(storage: Storage) -> MCPServer:
         note: str | None = None,
         allow_duplicate: bool = False,
         client_request_id: str | None = None,
+        subcategory: str | None = None,
     ) -> dict[str, Any]:
         """Log an expense.
 
@@ -62,9 +64,10 @@ def create_server(storage: Storage) -> MCPServer:
             note: Optional detail.
             allow_duplicate: Save even if a matching expense exists. Only set after the user confirms.
             client_request_id: Optional unique ID that makes retrying this request safe.
+            subcategory: Optional subcategory within the category.
         """
         return storage.add_expense(
-            amount, merchant, category, occurred_on, currency, note, allow_duplicate, client_request_id
+            amount, merchant, category, occurred_on, currency, note, allow_duplicate, client_request_id, subcategory
         )
 
     @server.tool(annotations=READ_ONLY)
@@ -78,10 +81,11 @@ def create_server(storage: Storage) -> MCPServer:
         include_deleted: bool = False,
         limit: int = 50,
         offset: int = 0,
+        subcategory: str | None = None,
     ) -> dict[str, Any]:
         """List expenses, newest first. Dates are YYYY-MM-DD and inclusive; merchant matches part of the name."""
         return storage.list_expenses(
-            start_date, end_date, category, merchant, currency, include_deleted, limit, offset
+            start_date, end_date, category, merchant, currency, include_deleted, limit, offset, subcategory
         )
 
     @server.tool()
@@ -94,9 +98,15 @@ def create_server(storage: Storage) -> MCPServer:
         merchant: str | None = None,
         category: str | None = None,
         note: str | None = None,
+        subcategory: str | None = None,
     ) -> dict[str, Any]:
-        """Change an expense. Leave out anything that stays the same; an empty note clears it."""
-        return storage.update_expense(expense_id, amount, currency, occurred_on, merchant, category, note)
+        """Change an expense. Leave out anything that stays the same; an empty note or subcategory clears it.
+
+        Changing the category clears the subcategory unless a new one is given.
+        """
+        return storage.update_expense(
+            expense_id, amount, currency, occurred_on, merchant, category, note, subcategory
+        )
 
     @server.tool()
     @_readable_errors
@@ -113,7 +123,7 @@ def create_server(storage: Storage) -> MCPServer:
     @server.tool(annotations=READ_ONLY)
     @_readable_errors
     def list_categories(include_archived: bool = False) -> dict[str, Any]:
-        """List categories and how many expenses each one has."""
+        """List categories with their subcategories, and how many expenses each one has."""
         return {"categories": storage.list_categories(include_archived)}
 
     @server.tool()
@@ -123,15 +133,30 @@ def create_server(storage: Storage) -> MCPServer:
         name: str,
         new_name: str | None = None,
         into: str | None = None,
+        subcategory: str | None = None,
     ) -> dict[str, Any]:
-        """Create, rename, archive, unarchive or merge categories.
+        """Create, rename, archive, unarchive or merge categories and subcategories.
 
         Args:
             action: What to do.
-            name: The category to act on.
+            name: The category to act on, or the parent category if subcategory is given.
             new_name: Required for rename.
-            into: Required for merge: the category that receives the expenses. The old one is archived.
+            into: Required for merge: the category that receives the expenses, or the subcategory
+                in the same category if subcategory is given. The old one is archived.
+            subcategory: Act on this subcategory of the named category instead of the category.
         """
+        if subcategory:
+            if action == "create":
+                return storage.create_subcategory(name, subcategory)
+            if action == "rename":
+                if not new_name:
+                    raise ToolError("Renaming needs new_name.")
+                return storage.rename_subcategory(name, subcategory, new_name)
+            if action == "merge":
+                if not into:
+                    raise ToolError("Merging needs into.")
+                return storage.merge_subcategory(name, subcategory, into)
+            return storage.set_subcategory_archived(name, subcategory, action == "archive")
         if action == "create":
             return storage.create_category(name)
         if action == "rename":
@@ -149,12 +174,16 @@ def create_server(storage: Storage) -> MCPServer:
     def summarize(
         start_date: str | None = None,
         end_date: str | None = None,
-        group_by: Literal["category", "merchant", "month"] = "category",
+        group_by: Literal["category", "subcategory", "merchant", "month"] = "category",
         category: str | None = None,
         currency: str | None = None,
+        subcategory: str | None = None,
     ) -> dict[str, Any]:
-        """Exact spending totals and counts for a period, per currency. Dates are YYYY-MM-DD and inclusive."""
-        return storage.summarize(start_date, end_date, group_by, category, currency)
+        """Exact spending totals and counts for a period, per currency. Dates are YYYY-MM-DD and inclusive.
+
+        Category totals include all their subcategories.
+        """
+        return storage.summarize(start_date, end_date, group_by, category, currency, subcategory)
 
     @server.tool()
     @_readable_errors

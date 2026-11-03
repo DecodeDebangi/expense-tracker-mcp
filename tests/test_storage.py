@@ -1,8 +1,10 @@
 import csv
+import sqlite3
 from pathlib import Path
 
 import pytest
 
+from expense_tracker.db import connect
 from expense_tracker.errors import ExpenseError
 from expense_tracker.storage import Storage
 
@@ -215,3 +217,132 @@ def test_export_writes_exact_data_with_private_permissions(seeded: Storage) -> N
         rows = list(csv.DictReader(file))
     assert [r["amount"] for r in rows][0] == "780.75"
     assert rows[-1]["currency"] == "USD"
+
+
+def add_loan(storage: Storage, merchant: str, subcategory: str, amount: str, day: str) -> dict:
+    return storage.add_expense(
+        amount, merchant, "loans & emis", day, subcategory=subcategory
+    )["expense"]
+
+
+def test_expense_can_have_a_subcategory_or_none(storage: Storage) -> None:
+    assert add_loan(storage, "Demo Bank", "home loan", "25000", "2026-05-01")["subcategory"] == "Home Loan"
+    assert add(storage)["expense"]["subcategory"] is None
+
+
+def test_subcategory_must_exist_in_the_expense_category(storage: Storage) -> None:
+    with pytest.raises(ExpenseError, match="Dining Out"):
+        add(storage, subcategory="Home Loan")
+    assert storage.list_expenses()["total"] == 0
+
+
+def test_database_rejects_a_subcategory_from_another_category(storage: Storage) -> None:
+    expense = add_loan(storage, "Demo Bank", "Home Loan", "25000", "2026-05-01")
+    conn = connect(storage.settings.db_path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE expenses SET category_id = (SELECT id FROM categories WHERE name = 'Food') WHERE id = ?",
+                (expense["id"],),
+            )
+    finally:
+        conn.close()
+
+
+def test_category_totals_include_subcategories_and_group_by_shows_them(storage: Storage) -> None:
+    add_loan(storage, "Demo Bank", "Home Loan", "25000", "2026-05-01")
+    add_loan(storage, "Demo Finance", "Two-wheeler Loan", "3000.50", "2026-05-02")
+    storage.add_expense("1000", "Other Lender", "Loans & EMIs", "2026-05-03")
+
+    by_category = storage.summarize()["groups"]
+    assert [(g["key"], g["total_minor"], g["count"]) for g in by_category] == [("Loans & EMIs", 2900050, 3)]
+
+    by_subcategory = storage.summarize(group_by="subcategory")["groups"]
+    assert [(g["key"], g["total_minor"]) for g in by_subcategory] == [
+        ("Loans & EMIs / Home Loan", 2500000),
+        ("Loans & EMIs / Two-wheeler Loan", 300050),
+        ("Loans & EMIs / (none)", 100000),
+    ]
+    assert sum(g["total_minor"] for g in by_subcategory) == 2900050
+
+    assert storage.summarize(subcategory="Home Loan")["totals"][0]["total_minor"] == 2500000
+    assert storage.list_expenses(subcategory="two-wheeler loan")["total"] == 1
+
+
+def test_update_subcategory_rules(storage: Storage) -> None:
+    expense = add_loan(storage, "Demo Bank", "Home Loan", "25000", "2026-05-01")
+    expense_id = expense["id"]
+
+    assert storage.update_expense(expense_id, note="kept")["subcategory"] == "Home Loan"
+    assert storage.update_expense(expense_id, subcategory="Car Loan")["subcategory"] == "Car Loan"
+    assert storage.update_expense(expense_id, category="Loans & EMIs")["subcategory"] == "Car Loan"
+    assert storage.update_expense(expense_id, subcategory="")["subcategory"] is None
+
+    storage.update_expense(expense_id, subcategory="Home Loan")
+    moved = storage.update_expense(expense_id, category="Food")
+    assert (moved["category"], moved["subcategory"]) == ("Food", None)
+
+    both = storage.update_expense(expense_id, category="Transport", subcategory="Fuel")
+    assert (both["category"], both["subcategory"]) == ("Transport", "Fuel")
+    with pytest.raises(ExpenseError):
+        storage.update_expense(expense_id, subcategory="Home Loan")
+
+
+def test_subcategory_lifecycle(storage: Storage) -> None:
+    storage.create_subcategory("Food", "Tiffin")
+    with pytest.raises(ExpenseError):
+        storage.create_subcategory("food", "tiffin")
+    storage.rename_subcategory("Food", "Tiffin", "Tiffin Service")
+    expense = add(storage, subcategory="Tiffin Service")["expense"]
+
+    storage.set_subcategory_archived("Food", "Tiffin Service", True)
+    with pytest.raises(ExpenseError, match="archived"):
+        add(storage, merchant="Other", subcategory="Tiffin Service")
+    food = next(c for c in storage.list_categories() if c["name"] == "Food")
+    assert "Tiffin Service" not in {s["name"] for s in food["subcategories"]}
+    assert storage.list_expenses()["expenses"][0]["subcategory"] == "Tiffin Service"
+
+    storage.set_subcategory_archived("Food", "Tiffin Service", False)
+    result = storage.merge_subcategory("Food", "Tiffin Service", "Office Meals")
+    assert result["expenses_moved"] == 1
+    assert storage.list_expenses()["expenses"][0]["id"] == expense["id"]
+    assert storage.list_expenses()["expenses"][0]["subcategory"] == "Office Meals"
+    with pytest.raises(ExpenseError):
+        storage.rename_subcategory("Food", "Office Meals", "Dining Out")
+    with pytest.raises(ExpenseError):
+        storage.merge_subcategory("Food", "Office Meals", "Office Meals")
+
+
+def test_same_subcategory_name_can_exist_in_different_categories(storage: Storage) -> None:
+    family = storage.add_expense("100", "Shop", "Family Support", "2026-05-01", subcategory="Gifts")
+    other = storage.add_expense("200", "Shop", "Other", "2026-05-02", subcategory="Gifts")
+    assert family["expense"]["category"] != other["expense"]["category"]
+    groups = storage.summarize(group_by="subcategory")["groups"]
+    assert {g["key"] for g in groups} == {"Family Support / Gifts", "Other / Gifts"}
+
+
+def test_merging_categories_carries_subcategories_and_keeps_totals(storage: Storage) -> None:
+    moved_along = storage.add_expense("100", "A", "Family Support", "2026-05-01", subcategory="Medical")["expense"]
+    joined = storage.add_expense("200", "B", "Family Support", "2026-05-02", subcategory="Gifts")["expense"]
+    plain = storage.add_expense("300", "C", "Family Support", "2026-05-03")["expense"]
+    deleted = storage.add_expense("400", "D", "Family Support", "2026-05-04", subcategory="Gifts")["expense"]
+    storage.delete_expense(deleted["id"])
+    before = storage.summarize()["totals"]
+
+    assert storage.merge_category("Family Support", "Other")["expenses_moved"] == 4
+
+    assert storage.summarize()["totals"] == before
+    result = {e["id"]: e for e in storage.list_expenses(include_deleted=True)["expenses"]}
+    assert (result[moved_along["id"]]["category"], result[moved_along["id"]]["subcategory"]) == ("Other", "Medical")
+    assert (result[joined["id"]]["category"], result[joined["id"]]["subcategory"]) == ("Other", "Gifts")
+    assert (result[plain["id"]]["category"], result[plain["id"]]["subcategory"]) == ("Other", None)
+    assert (result[deleted["id"]]["category"], result[deleted["id"]]["subcategory"]) == ("Other", "Gifts")
+    other = next(c for c in storage.list_categories() if c["name"] == "Other")
+    assert sum(s["name"] == "Gifts" for s in other["subcategories"]) == 1
+    assert "Medical" in {s["name"] for s in other["subcategories"]}
+
+
+def test_export_includes_the_subcategory(storage: Storage) -> None:
+    add_loan(storage, "Demo Bank", "Home Loan", "25000", "2026-05-01")
+    with open(storage.export_csv()["path"], newline="") as file:
+        assert next(csv.DictReader(file))["subcategory"] == "Home Loan"

@@ -15,18 +15,22 @@ from expense_tracker.errors import ExpenseError
 
 MAX_PAGE_SIZE = 500
 EXPENSE_COLUMNS = """
-    e.id, e.amount_minor, e.currency, e.occurred_on, e.merchant, c.name AS category, e.note,
+    e.id, e.amount_minor, e.currency, e.occurred_on, e.merchant, c.name AS category,
+    s.name AS subcategory, e.note,
     e.source, e.created_at, e.updated_at, e.deleted_at
 """
-EXPENSE_FROM = "FROM expenses e JOIN categories c ON c.id = e.category_id"
+EXPENSE_FROM = """FROM expenses e
+    JOIN categories c ON c.id = e.category_id
+    LEFT JOIN subcategories s ON s.id = e.subcategory_id"""
 GROUP_EXPRESSIONS = {
     "category": "c.name",
+    "subcategory": "c.name || ' / ' || coalesce(s.name, '(none)')",
     "merchant": "e.merchant COLLATE NOCASE",
     "month": "substr(e.occurred_on, 1, 7)",
 }
 CSV_FIELDS = (
     "id", "occurred_on", "amount", "amount_minor", "currency", "merchant", "category",
-    "note", "source", "created_at", "updated_at", "deleted_at",
+    "subcategory", "note", "source", "created_at", "updated_at", "deleted_at",
 )
 
 
@@ -79,6 +83,26 @@ class Storage:
         return row["id"]
 
     @staticmethod
+    def _active_subcategory_id(conn: sqlite3.Connection, category_id: int, name: str) -> int:
+        row = conn.execute(
+            "SELECT id, archived_at FROM subcategories WHERE category_id = ? AND name = ?",
+            (category_id, validation.clean_category_name(name)),
+        ).fetchone()
+        if row is None or row["archived_at"]:
+            problem = "is archived" if row else "doesn't exist in that category"
+            names = [
+                r["name"]
+                for r in conn.execute(
+                    """SELECT name FROM subcategories
+                    WHERE category_id = ? AND archived_at IS NULL ORDER BY name""",
+                    (category_id,),
+                )
+            ]
+            available = ", ".join(names) or "none"
+            raise ExpenseError(f"The subcategory '{name}' {problem}. Available: {available}.")
+        return row["id"]
+
+    @staticmethod
     def _get_expense(conn: sqlite3.Connection, expense_id: str) -> sqlite3.Row:
         row = conn.execute(
             f"SELECT {EXPENSE_COLUMNS} {EXPENSE_FROM} WHERE e.id = ?", (expense_id,)
@@ -97,6 +121,7 @@ class Storage:
         note: str | None = None,
         allow_duplicate: bool = False,
         client_request_id: str | None = None,
+        subcategory: str | None = None,
     ) -> dict:
         code = validation.parse_currency(currency or self.settings.default_currency)
         amount_minor = validation.parse_amount(amount, code)
@@ -114,6 +139,9 @@ class Storage:
                     return {"status": "already_saved", "saved": False, "expense": _expense(existing)}
 
             category_id = self._active_category_id(conn, category)
+            subcategory_id = (
+                self._active_subcategory_id(conn, category_id, subcategory) if subcategory else None
+            )
             if not allow_duplicate:
                 duplicates = conn.execute(
                     f"""SELECT {EXPENSE_COLUMNS} {EXPENSE_FROM}
@@ -134,9 +162,9 @@ class Storage:
             now = _now()
             conn.execute(
                 """INSERT INTO expenses (id, amount_minor, currency, occurred_on, merchant,
-                    category_id, note, client_request_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (expense_id, amount_minor, code, day, merchant, category_id, note,
+                    category_id, subcategory_id, note, client_request_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (expense_id, amount_minor, code, day, merchant, category_id, subcategory_id, note,
                  client_request_id, now, now),
             )
             return {
@@ -153,6 +181,7 @@ class Storage:
         merchant: str | None = None,
         currency: str | None = None,
         include_deleted: bool = False,
+        subcategory: str | None = None,
     ) -> tuple[str, list]:
         start, end = validation.parse_date_range(start_date, end_date)
         clauses, params = ["1 = 1"], []
@@ -167,6 +196,9 @@ class Storage:
         if category:
             clauses.append("c.name = ?")
             params.append(validation.clean_category_name(category))
+        if subcategory:
+            clauses.append("s.name = ?")
+            params.append(validation.clean_category_name(subcategory))
         if merchant:
             escaped = merchant.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             clauses.append("e.merchant LIKE ? ESCAPE '\\'")
@@ -186,13 +218,14 @@ class Storage:
         include_deleted: bool = False,
         limit: int = 50,
         offset: int = 0,
+        subcategory: str | None = None,
     ) -> dict:
         if not 1 <= limit <= MAX_PAGE_SIZE:
             raise ExpenseError(f"The limit must be between 1 and {MAX_PAGE_SIZE}.")
         if offset < 0:
             raise ExpenseError("The offset can't be negative.")
         where, params = self._filters(
-            start_date, end_date, category, merchant, currency, include_deleted
+            start_date, end_date, category, merchant, currency, include_deleted, subcategory
         )
         with self._connection() as conn:
             total = conn.execute(
@@ -214,7 +247,9 @@ class Storage:
         merchant: str | None = None,
         category: str | None = None,
         note: str | None = None,
+        subcategory: str | None = None,
     ) -> dict:
+        """An empty subcategory clears it, and moving to another category also clears it unless a new one is given."""
         changes: dict[str, object] = {}
         with self._connection() as conn, transaction(conn):
             current = self._get_expense(conn, expense_id)
@@ -233,8 +268,19 @@ class Storage:
                 changes["occurred_on"] = validation.parse_expense_date(occurred_on)
             if merchant is not None:
                 changes["merchant"] = validation.clean_merchant(merchant)
+            current_ids = conn.execute(
+                "SELECT category_id, subcategory_id FROM expenses WHERE id = ?", (expense_id,)
+            ).fetchone()
+            category_id = current_ids["category_id"]
             if category is not None:
-                changes["category_id"] = self._active_category_id(conn, category)
+                category_id = self._active_category_id(conn, category)
+                changes["category_id"] = category_id
+            if subcategory is not None and subcategory.strip():
+                changes["subcategory_id"] = self._active_subcategory_id(conn, category_id, subcategory)
+            elif subcategory is not None or (
+                category_id != current_ids["category_id"] and current_ids["subcategory_id"]
+            ):
+                changes["subcategory_id"] = None
             if note is not None:
                 changes["note"] = validation.clean_note(note)
             if not changes:
@@ -278,10 +324,31 @@ class Storage:
                 LEFT JOIN expenses e ON e.category_id = c.id AND e.deleted_at IS NULL
                 {where} GROUP BY c.id ORDER BY c.name"""
             ).fetchall()
-        return [
-            {"name": r["name"], "archived": bool(r["archived"]), "expense_count": r["expense_count"]}
-            for r in rows
-        ]
+        categories = []
+        with self._connection() as conn:
+            subcategories = conn.execute(
+                f"""SELECT c.name AS category, s.name, s.archived_at IS NOT NULL AS archived,
+                    count(e.id) AS expense_count
+                FROM subcategories s
+                JOIN categories c ON c.id = s.category_id
+                LEFT JOIN expenses e ON e.subcategory_id = s.id AND e.deleted_at IS NULL
+                {"" if include_archived else "WHERE s.archived_at IS NULL"}
+                GROUP BY s.id ORDER BY s.name"""
+            ).fetchall()
+        for r in rows:
+            categories.append(
+                {
+                    "name": r["name"],
+                    "archived": bool(r["archived"]),
+                    "expense_count": r["expense_count"],
+                    "subcategories": [
+                        {"name": s["name"], "archived": bool(s["archived"]), "expense_count": s["expense_count"]}
+                        for s in subcategories
+                        if s["category"] == r["name"]
+                    ],
+                }
+            )
+        return categories
 
     def create_category(self, name: str) -> dict:
         name = validation.clean_category_name(name)
@@ -339,12 +406,108 @@ class Storage:
             if source["id"] == target_id:
                 raise ExpenseError("A category can't be merged into itself.")
             now = _now()
-            moved = conn.execute(
+            count = conn.execute(
+                "SELECT count(*) FROM expenses WHERE category_id = ?", (source["id"],)
+            ).fetchone()[0]
+            # Subcategories come along. One whose name already exists in the target joins that one.
+            for sub in conn.execute(
+                "SELECT id, name FROM subcategories WHERE category_id = ?", (source["id"],)
+            ).fetchall():
+                same_name = conn.execute(
+                    "SELECT id FROM subcategories WHERE category_id = ? AND name = ?",
+                    (target_id, sub["name"]),
+                ).fetchone()
+                if same_name:
+                    conn.execute(
+                        """UPDATE expenses SET category_id = ?, subcategory_id = ?, updated_at = ?
+                        WHERE subcategory_id = ?""",
+                        (target_id, same_name["id"], now, sub["id"]),
+                    )
+                    conn.execute("DELETE FROM subcategories WHERE id = ?", (sub["id"],))
+                else:
+                    conn.execute(
+                        "UPDATE subcategories SET category_id = ? WHERE id = ?",
+                        (target_id, sub["id"]),
+                    )
+            conn.execute(
                 "UPDATE expenses SET category_id = ?, updated_at = ? WHERE category_id = ?",
+                (target_id, now, source["id"]),
+            )
+            conn.execute(
+                "UPDATE categories SET archived_at = coalesce(archived_at, ?) WHERE id = ?",
+                (now, source["id"]),
+            )
+        return {"merged": source["name"], "into": into, "expenses_moved": count}
+
+    @staticmethod
+    def _subcategory_row(conn: sqlite3.Connection, category_id: int, name: str) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT id, name, archived_at FROM subcategories WHERE category_id = ? AND name = ?",
+            (category_id, validation.clean_category_name(name)),
+        ).fetchone()
+        if row is None:
+            raise ExpenseError(f"The subcategory '{name}' doesn't exist in that category.")
+        return row
+
+    def create_subcategory(self, category: str, name: str) -> dict:
+        name = validation.clean_category_name(name)
+        with self._connection() as conn, transaction(conn):
+            category_id = self._active_category_id(conn, category)
+            existing = conn.execute(
+                "SELECT name, archived_at FROM subcategories WHERE category_id = ? AND name = ?",
+                (category_id, name),
+            ).fetchone()
+            if existing:
+                state = "exists but is archived; unarchive it" if existing["archived_at"] else "already exists"
+                raise ExpenseError(f"The subcategory '{existing['name']}' {state}.")
+            conn.execute(
+                "INSERT INTO subcategories (category_id, name, created_at) VALUES (?, ?, ?)",
+                (category_id, name, _now()),
+            )
+        return {"category": category, "name": name, "archived": False}
+
+    def rename_subcategory(self, category: str, name: str, new_name: str) -> dict:
+        new_name = validation.clean_category_name(new_name)
+        with self._connection() as conn, transaction(conn):
+            category_id = self._category_row(conn, category)["id"]
+            row = self._subcategory_row(conn, category_id, name)
+            clash = conn.execute(
+                "SELECT id FROM subcategories WHERE category_id = ? AND name = ? AND id != ?",
+                (category_id, new_name, row["id"]),
+            ).fetchone()
+            if clash:
+                raise ExpenseError(f"The subcategory '{new_name}' already exists. Merge them instead.")
+            conn.execute("UPDATE subcategories SET name = ? WHERE id = ?", (new_name, row["id"]))
+        return {"category": category, "name": new_name}
+
+    def set_subcategory_archived(self, category: str, name: str, archived: bool) -> dict:
+        with self._connection() as conn, transaction(conn):
+            category_id = self._category_row(conn, category)["id"]
+            row = self._subcategory_row(conn, category_id, name)
+            if bool(row["archived_at"]) == archived:
+                state = "archived" if archived else "active"
+                raise ExpenseError(f"The subcategory '{row['name']}' is already {state}.")
+            conn.execute(
+                "UPDATE subcategories SET archived_at = ? WHERE id = ?",
+                (_now() if archived else None, row["id"]),
+            )
+        return {"category": category, "name": row["name"], "archived": archived}
+
+    def merge_subcategory(self, category: str, name: str, into: str) -> dict:
+        """Move every expense, including deleted ones, and archive the old subcategory."""
+        with self._connection() as conn, transaction(conn):
+            category_id = self._category_row(conn, category)["id"]
+            source = self._subcategory_row(conn, category_id, name)
+            target_id = self._active_subcategory_id(conn, category_id, into)
+            if source["id"] == target_id:
+                raise ExpenseError("A subcategory can't be merged into itself.")
+            now = _now()
+            moved = conn.execute(
+                "UPDATE expenses SET subcategory_id = ?, updated_at = ? WHERE subcategory_id = ?",
                 (target_id, now, source["id"]),
             ).rowcount
             conn.execute(
-                "UPDATE categories SET archived_at = coalesce(archived_at, ?) WHERE id = ?",
+                "UPDATE subcategories SET archived_at = coalesce(archived_at, ?) WHERE id = ?",
                 (now, source["id"]),
             )
         return {"merged": source["name"], "into": into, "expenses_moved": moved}
@@ -356,10 +519,13 @@ class Storage:
         group_by: str = "category",
         category: str | None = None,
         currency: str | None = None,
+        subcategory: str | None = None,
     ) -> dict:
         if group_by not in GROUP_EXPRESSIONS:
             raise ExpenseError(f"group_by must be one of: {', '.join(GROUP_EXPRESSIONS)}.")
-        where, params = self._filters(start_date, end_date, category, None, currency)
+        where, params = self._filters(
+            start_date, end_date, category, None, currency, subcategory=subcategory
+        )
         group = GROUP_EXPRESSIONS[group_by]
         order = "e.currency, grp" if group_by == "month" else "e.currency, total DESC, grp"
         with self._connection() as conn:
